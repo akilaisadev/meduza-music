@@ -5,14 +5,15 @@ A premium, Spotify-inspired music player for Linux, built with Flutter. Streams 
 ## Features
 
 - 🎧 **Stream any song** from YouTube Music
-- 🏠 **Smart Home Feed** — 25+ dynamic rows refreshed based on your taste
+- 🏠 **Smart Home Feed** — Dynamically adapts and generates categories based on your top artists and genres using `MeduzaIntelligenceEngine`.
 - 🔍 **Instant Search** — results appear as you type, play immediately
 - 📻 **Radio Mode** — auto-fetches related tracks so the music never stops
 - 💾 **Home Cache** — loads in 0ms from local cache between sessions
 - 🎨 **Dynamic Theming** — UI color changes with each track (13 preset hues)
 - 🖥️ **Full-Screen Player** — click the album art to open the cinematic view
 - 📋 **Playlists & Liked Songs**
-- ⚡ **Fast Track Switching** — generation-based cancellation, no stale audio
+- ⚡ **Fast Track Switching** — generation-based cancellation, no stale audio, increased buffer size for smooth playback.
+- 🚀 **Extreme Native Performance** — Aggressively optimized Linux release build using `-march=native` and `-mtune=native`.
 - 🔁 Loop / 🔀 Shuffle / ⏭ Queue management
 
 ## Running (Development)

@@ -18,7 +18,7 @@ class _DiscoverViewState extends State<DiscoverView> {
   final YouTubeFetcher _fetcher = YouTubeFetcher();
 
   // 5 focused, distinct genre rows — no flooding
-  final List<Map<String, String>> _categories = [
+  List<Map<String, String>> _categories = [
     {'title': 'Trending Now',         'query': 'trending music 2024 hits'},
     {'title': 'Chill Lofi & Study',   'query': 'lofi hip hop study chill'},
     {'title': 'Late Night Vibes',     'query': 'night drive chill pop synthwave'},
@@ -41,6 +41,52 @@ class _DiscoverViewState extends State<DiscoverView> {
   Future<void> _loadInitialMusic() async {
     final pm = context.read<PlaybackManager>();
     final cache = await HomeCacheManager.loadCache();
+
+    // Build dynamic categories based on user taste
+    final topArtists = MeduzaIntelligenceEngine.artistPlayCounts.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+    final topGenres = MeduzaIntelligenceEngine.genreAffinity.entries.toList()
+      ..sort((a, b) => b.value.compareTo(a.value));
+
+    if (topArtists.isNotEmpty || topGenres.isNotEmpty) {
+      final newCategories = <Map<String, String>>[];
+      newCategories.add({'title': 'Trending Now', 'query': 'trending music 2024 hits'});
+
+      if (topArtists.isNotEmpty && topArtists.first.key.isNotEmpty) {
+         final artist = topArtists.first.key;
+         final displayArtist = artist[0].toUpperCase() + artist.substring(1);
+         newCategories.add({'title': 'Because you listen to $displayArtist', 'query': '$artist mix tracks'});
+      }
+      if (topGenres.isNotEmpty && topGenres.first.key.isNotEmpty) {
+         final genre = topGenres.first.key;
+         final displayGenre = genre[0].toUpperCase() + genre.substring(1);
+         newCategories.add({'title': 'Your favorite vibes: $displayGenre', 'query': '$genre music mix'});
+      }
+      if (topArtists.length > 1 && topArtists[1].key.isNotEmpty) {
+         final artist2 = topArtists[1].key;
+         final displayArtist2 = artist2[0].toUpperCase() + artist2.substring(1);
+         newCategories.add({'title': 'More like $displayArtist2', 'query': '$artist2 radio songs'});
+      }
+      if (topGenres.length > 1 && topGenres[1].key.isNotEmpty) {
+         final genre2 = topGenres[1].key;
+         final displayGenre2 = genre2[0].toUpperCase() + genre2.substring(1);
+         newCategories.add({'title': 'Explore $displayGenre2', 'query': '$genre2 chill hits'});
+      }
+
+      final defaultCats = [
+        {'title': 'Chill Lofi & Study',   'query': 'lofi hip hop study chill'},
+        {'title': 'Late Night Vibes',     'query': 'night drive chill pop synthwave'},
+        {'title': 'Workout Energy',       'query': 'gym workout hype edm'},
+        {'title': 'Acoustic & Soul',      'query': 'acoustic soul guitar singer songwriter'},
+      ];
+
+      int idx = 0;
+      while (newCategories.length < 5 && idx < defaultCats.length) {
+        newCategories.add(defaultCats[idx]);
+        idx++;
+      }
+      _categories = newCategories.take(5).toList();
+    }
 
     if (mounted) {
       setState(() {
