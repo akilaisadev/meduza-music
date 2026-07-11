@@ -8,6 +8,8 @@ class PlaybackManager extends ChangeNotifier {
   final Player _player = Player(
     configuration: const PlayerConfiguration(
       logLevel: MPVLogLevel.warn,
+      bufferSize: 128 * 1024 * 1024,
+      pitch: false,
     ),
   );
 
