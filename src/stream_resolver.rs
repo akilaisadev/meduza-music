@@ -80,6 +80,7 @@ impl StreamResolver {
     }
 
     /// Search YouTube Music for a query and return the first video ID found.
+    #[allow(dead_code)]
     pub fn search_first_video_id(query: &str) -> Option<String> {
         let search_query = format!("ytmsearch1:{}", query);
         let mut cmd = Self::yt_dlp_cmd();
@@ -106,6 +107,7 @@ impl StreamResolver {
     }
 
     /// Search YouTube Music and return full TrackItems.
+    #[allow(dead_code)]
     pub fn search_tracks(query: &str, limit: usize) -> Vec<TrackItem> {
         let search_query = format!("ytmsearch{}:{}", limit, query);
         let mut cmd = Self::yt_dlp_cmd();

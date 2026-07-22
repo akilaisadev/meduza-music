@@ -3,6 +3,8 @@ mod stream_resolver;
 mod playback_manager;
 mod ui;
 pub mod settings;
+pub mod data_saver;
+pub mod recommendation_engine;
 
 use eframe::{egui, NativeOptions};
 use ui::MeduzaApp;

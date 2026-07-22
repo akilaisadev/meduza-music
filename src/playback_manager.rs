@@ -40,9 +40,12 @@ pub struct PlaybackManager {
     pub track_ended:   Arc<Mutex<bool>>,
     pub is_shuffle:    Arc<Mutex<bool>>,
     pub repeat_mode:   Arc<Mutex<RepeatMode>>,
-    pub liked_songs:   Arc<Mutex<Vec<TrackItem>>>,
-    pub settings:      Arc<Mutex<crate::settings::AppSettings>>,
-    pub stream_cache:  Arc<Mutex<Option<(String, String)>>>,
+    pub liked_songs:           Arc<Mutex<Vec<TrackItem>>>,
+    pub history:               Arc<Mutex<Vec<TrackItem>>>,
+    pub settings:              Arc<Mutex<crate::settings::AppSettings>>,
+    pub stream_cache:          Arc<Mutex<Option<(String, String)>>>,
+    pub data_saver:            Arc<Mutex<crate::data_saver::DataSaver>>,
+    pub recommendation_engine: Arc<Mutex<crate::recommendation_engine::RecommendationEngine>>,
 
     mpv_process: Arc<Mutex<Option<Child>>>,
     innertube:   Arc<InnerTubeClient>,
@@ -76,7 +79,10 @@ impl PlaybackManager {
         let current_track = Arc::new(Mutex::new(None));
         let queue         = Arc::new(Mutex::new(Vec::<QueueItem>::new()));
         let queue_index   = Arc::new(Mutex::new(0));
-        let stream_cache  = Arc::new(Mutex::new(None));
+        let stream_cache          = Arc::new(Mutex::new(None));
+        let history               = Arc::new(Mutex::new(Vec::<TrackItem>::new()));
+        let data_saver            = Arc::new(Mutex::new(crate::data_saver::DataSaver::new()));
+        let recommendation_engine = Arc::new(Mutex::new(crate::recommendation_engine::RecommendationEngine::new()));
 
         // ── Background IPC poller (runs every 500 ms, never blocks the UI) ──
         let state_bg    = Arc::clone(&state);
@@ -87,6 +93,7 @@ impl PlaybackManager {
         let queue_bg    = Arc::clone(&queue);
         let idx_bg      = Arc::clone(&queue_index);
         let cache_bg    = Arc::clone(&stream_cache);
+        let settings_bg = Arc::clone(&settings);
 
         thread::spawn(move || {
             loop {
@@ -132,10 +139,35 @@ impl PlaybackManager {
                         *lk!(duration_bg) = dur as f32;
                     }
                 }
-                // eof-reached
+                // eof-reached: auto-advance to next track in queue when audio reaches end
                 if let Some(eof) = ipc_get_bool("eof-reached") {
                     if eof {
-                        *lk!(ended_bg) = true;
+                        let mut end_flag = lk!(ended_bg);
+                        if !*end_flag {
+                            *end_flag = true;
+                            let q = lk!(queue_bg).clone();
+                            if !q.is_empty() {
+                                let mut idx_g = lk!(idx_bg);
+                                let next_idx = if *idx_g + 1 < q.len() { *idx_g + 1 } else { 0 };
+                                *idx_g = next_idx;
+                                let next_track = q[next_idx].track.clone();
+                                drop(idx_g);
+                                
+                                println!("[Playback] Track finished (eof-reached) — auto-playing next track: {}", next_track.title);
+                                *lk!(curr_bg)     = Some(next_track.clone());
+                                *lk!(duration_bg) = next_track.duration_seconds as f32;
+                                *lk!(progress_bg) = 0.0;
+                                *lk!(cache_bg)    = None;
+
+                                let quality = lk!(settings_bg).audio_quality;
+                                thread::spawn(move || {
+                                    if let Some(url) = crate::stream_resolver::StreamResolver::get_audio_url(&next_track.media_id, quality) {
+                                        ipc_send(serde_json::json!({"command": ["loadfile", url, "replace"]}));
+                                        ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
+                                    }
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -153,8 +185,11 @@ impl PlaybackManager {
             is_shuffle:    Arc::new(Mutex::new(false)),
             repeat_mode:   Arc::new(Mutex::new(RepeatMode::Off)),
             liked_songs:   Arc::new(Mutex::new(Vec::new())),
+            history,
             settings,
             stream_cache,
+            data_saver,
+            recommendation_engine,
             mpv_process:   mpv_proc,
             innertube,
         }
@@ -162,6 +197,14 @@ impl PlaybackManager {
 
     /// Play a track — resolves URL via yt-dlp, then streams via mpv.
     pub fn play_now(&self, track: TrackItem) {
+        // Record in listening history
+        {
+            let mut h = lk!(self.history);
+            h.retain(|t| t.media_id != track.media_id);
+            h.insert(0, track.clone());
+            if h.len() > 30 { h.pop(); }
+        }
+
         // Immediately halt old track audio output so old song never keeps playing
         ipc_send(serde_json::json!({"command": ["stop"]}));
 
@@ -173,15 +216,30 @@ impl PlaybackManager {
         *lk!(self.queue_index)   = 0;
         *lk!(self.stream_cache)  = None;
 
-        let state_c  = Arc::clone(&self.state);
-        let mpv_proc = Arc::clone(&self.mpv_process);
-        let volume   = *lk!(self.volume);
-        let video_id = track.media_id.clone();
-
-        let quality  = lk!(self.settings).audio_quality;
+        let state_c      = Arc::clone(&self.state);
+        let mpv_proc     = Arc::clone(&self.mpv_process);
+        let volume       = *lk!(self.volume);
+        let video_id     = track.media_id.clone();
+        let quality      = lk!(self.settings).audio_quality;
+        let data_saver_c = Arc::clone(&self.data_saver);
+        let reco_c       = Arc::clone(&self.recommendation_engine);
+        let track_cl     = track.clone();
 
         thread::spawn(move || {
             ensure_mpv_running(&mpv_proc);
+
+            // Record user taste activity
+            lk!(reco_c).record_play(track_cl);
+
+            // Check DataSaver local disk cache (0-data instant replay!)
+            if let Some(cached_path) = lk!(data_saver_c).get_cached_file(&video_id) {
+                println!("[DataSaver] ZERO-DATA INSTANT PLAYBACK FROM DISK: {}", cached_path);
+                ipc_send(serde_json::json!({"command": ["loadfile", cached_path, "replace"]}));
+                ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
+                ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
+                *lk!(state_c) = PlaybackState::Playing;
+                return;
+            }
 
             println!("[Playback] Resolving stream for {}", video_id);
             let Some(url) = StreamResolver::get_audio_url(&video_id, quality) else {
@@ -195,9 +253,12 @@ impl PlaybackManager {
             ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
             *lk!(state_c) = PlaybackState::Playing;
             println!("[Playback] Streaming: {}", video_id);
+
+            // Cache stream to disk in background so future plays consume 0 data!
+            lk!(data_saver_c).cache_stream_in_bg(video_id, url);
         });
 
-        // Immediately trigger background preloader for track N+1
+        // Immediately trigger background preloader (waits until Playing state)
         self.trigger_background_preloader(track.clone());
 
         // Fetch radio queue in background
@@ -295,6 +356,14 @@ impl PlaybackManager {
 
     /// Internal helper: play track without resetting active radio queue.
     fn play_now_without_queue_reset(&self, track: TrackItem) {
+        // Record in listening history
+        {
+            let mut h = lk!(self.history);
+            h.retain(|t| t.media_id != track.media_id);
+            h.insert(0, track.clone());
+            if h.len() > 30 { h.pop(); }
+        }
+
         ipc_send(serde_json::json!({"command": ["stop"]}));
 
         *lk!(self.current_track) = Some(track.clone());
@@ -354,11 +423,19 @@ impl PlaybackManager {
         let idx_c    = Arc::clone(&self.queue_index);
         let shuf_c   = Arc::clone(&self.is_shuffle);
         let curr_c   = Arc::clone(&self.current_track);
+        let state_c  = Arc::clone(&self.state);
         let vid_c    = current_track.media_id.clone();
         let quality  = lk!(self.settings).audio_quality;
 
         thread::spawn(move || {
-            thread::sleep(Duration::from_millis(200));
+            // Wait until primary stream starts playing smoothly to avoid network contention
+            loop {
+                thread::sleep(Duration::from_millis(300));
+                let st = lk!(state_c).clone();
+                if matches!(st, PlaybackState::Playing) { break; }
+                if matches!(st, PlaybackState::Idle | PlaybackState::Error(_)) { return; }
+            }
+
             if let Some(ref t) = *lk!(curr_c) {
                 if t.media_id != vid_c { return; }
             } else {

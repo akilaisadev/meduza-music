@@ -345,19 +345,31 @@ impl MeduzaApp {
     fn show_home(&mut self, ui: &mut egui::Ui) {
         let loading  = *self.is_loading_home.lock().unwrap();
         let sections = self.sections.lock().unwrap().clone();
+        let mut seen = std::collections::HashSet::<String>::new();
 
-        if loading && sections.is_empty() {
+        let heavy_rot_raw = self.playback.recommendation_engine.lock().unwrap().get_heavy_rotation(8);
+        let heavy_rot     = crate::recommendation_engine::RecommendationEngine::filter_unique(&heavy_rot_raw, &mut seen);
+
+        let history_raw   = self.playback.history.lock().unwrap().clone();
+        let history       = crate::recommendation_engine::RecommendationEngine::filter_unique(&history_raw, &mut seen);
+
+        let liked_raw     = self.playback.liked_songs.lock().unwrap().clone();
+        let liked         = crate::recommendation_engine::RecommendationEngine::filter_unique(&liked_raw, &mut seen);
+
+        let top_artist    = self.playback.recommendation_engine.lock().unwrap().get_top_artist();
+
+        if loading && sections.is_empty() && history.is_empty() && heavy_rot.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.add(egui::Spinner::new().size(44.0).color(ACCENT));
                 ui.add_space(12.0);
-                ui.label(RichText::new("Loading your feed…").color(T_SEC)
+                ui.label(RichText::new("Loading your personalized feed…").color(T_SEC)
                     .font(FontId::proportional(15.0)));
             });
             return;
         }
 
-        if sections.is_empty() {
+        if sections.is_empty() && history.is_empty() && liked.is_empty() && heavy_rot.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("⚠  Could not load feed").color(T_SEC)
@@ -383,12 +395,71 @@ impl MeduzaApp {
             .id_source("home")
             .show(ui, |ui| {
                 ui.add_space(8.0);
-                for section in &sections {
-                    ui.label(RichText::new(&section.title).color(T_PRI)
-                        .font(FontId::proportional(18.0)).strong());
+
+                // 1. Recommendation Engine: Your Heavy Rotation
+                if !heavy_rot.is_empty() {
+                    ui.label(
+                        RichText::new("🔥 Your Heavy Rotation ⚡")
+                            .color(T_PRI)
+                            .font(FontId::proportional(19.0))
+                            .strong(),
+                    );
                     ui.add_space(10.0);
-                    self.card_grid(ui, &section.items.clone());
-                    ui.add_space(24.0);
+                    self.card_grid(ui, &heavy_rot);
+                    ui.add_space(26.0);
+                }
+
+                // 2. Dynamic Taste Section: Recently Played (Deduplicated)
+                if !history.is_empty() {
+                    ui.label(
+                        RichText::new("Recently Played 🎧")
+                            .color(T_PRI)
+                            .font(FontId::proportional(19.0))
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                    self.card_grid(ui, &history);
+                    ui.add_space(26.0);
+                }
+
+                // 3. Dynamic Taste Section: Top Artist Mix
+                if let Some(ref artist) = top_artist {
+                    ui.label(
+                        RichText::new(format!("💡 More Like {} ✨", artist))
+                            .color(T_PRI)
+                            .font(FontId::proportional(19.0))
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                }
+
+                // 4. Dynamic Taste Section: Rediscover Favorites
+                if !liked.is_empty() {
+                    ui.label(
+                        RichText::new("Rediscover Your Favorites ❤️")
+                            .color(T_PRI)
+                            .font(FontId::proportional(19.0))
+                            .strong(),
+                    );
+                    ui.add_space(10.0);
+                    self.card_grid(ui, &liked);
+                    ui.add_space(26.0);
+                }
+
+                // 5. InnerTube Discovery Feed Sections (Deduplicated)
+                for section in &sections {
+                    let unique_items = crate::recommendation_engine::RecommendationEngine::filter_unique(&section.items, &mut seen);
+                    if !unique_items.is_empty() {
+                        ui.label(
+                            RichText::new(&section.title)
+                                .color(T_PRI)
+                                .font(FontId::proportional(19.0))
+                                .strong(),
+                        );
+                        ui.add_space(10.0);
+                        self.card_grid(ui, &unique_items);
+                        ui.add_space(26.0);
+                    }
                 }
             });
     }
@@ -425,22 +496,24 @@ impl MeduzaApp {
     }
 
     fn draw_card(&mut self, ui: &mut egui::Ui, track: &TrackItem, card_w: f32) {
-        let img_size  = card_w - 20.0; // image is card width minus padding
-        let card_h    = img_size + 62.0; // image + title + artist + spacing
+        let pad       = 10.0_f32;
+        let img_size  = card_w - pad * 2.0;
+        let card_h    = img_size + 64.0;
         let desired   = Vec2::new(card_w, card_h);
         let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
 
-        // Hover / active background
-        let bg_color = if response.is_pointer_button_down_on() {
-            Color32::from_rgb(50, 50, 50)
+        // Hover / Active Background Frame (Elevated Glassmorphic Fill & Border)
+        let (bg_color, stroke_col) = if response.is_pointer_button_down_on() {
+            (Color32::from_rgb(38, 38, 46), Color32::from_rgb(60, 60, 70))
         } else if response.hovered() {
-            BG_CARD_HV
+            (Color32::from_rgb(28, 28, 34), Color32::from_rgb(50, 50, 58))
         } else {
-            BG_CARD
+            (Color32::from_rgb(20, 20, 24), Color32::from_rgb(32, 32, 36))
         };
-        ui.painter().rect_filled(rect, Rounding::same(10.0), bg_color);
 
-        let pad      = 10.0;
+        ui.painter().rect_filled(rect, Rounding::same(12.0), bg_color);
+        ui.painter().rect_stroke(rect, Rounding::same(12.0), Stroke::new(1.0_f32, stroke_col));
+
         let img_rect = egui::Rect::from_min_size(
             rect.min + egui::vec2(pad, pad),
             Vec2::splat(img_size),
@@ -453,19 +526,17 @@ impl MeduzaApp {
             &track.media_id, &track.thumbnail_url,
         ) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
-            // Clip to rounded rect
             ui.painter().with_clip_rect(img_rect).image(tex.id(), img_rect, uv, Color32::WHITE);
-            // Round corners overlay (subtle dark border)
-            ui.painter().rect_stroke(img_rect, Rounding::same(8.0), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(0,0,0,60)));
+            ui.painter().rect_stroke(img_rect, Rounding::same(8.0), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255,255,255,15)));
         } else {
-            ui.painter().rect_filled(img_rect, Rounding::same(8.0), Color32::from_rgb(30, 30, 38));
+            ui.painter().rect_filled(img_rect, Rounding::same(8.0), Color32::from_rgb(28, 28, 36));
             ui.painter().text(
                 img_rect.center(), egui::Align2::CENTER_CENTER,
                 "♪", FontId::proportional(34.0), T_DIM,
             );
         }
 
-        // Clip text strictly inside card rectangle
+        // Text Clip
         let card_clip = egui::Rect::from_min_max(
             rect.min + egui::vec2(pad, 0.0),
             rect.max - egui::vec2(pad, 0.0),
@@ -492,7 +563,7 @@ impl MeduzaApp {
             T_SEC,
         );
 
-        // Hover play button
+        // Animated Hover Green Play Button Overlay
         if response.hovered() {
             let c = egui::pos2(img_rect.max.x - 22.0, img_rect.max.y - 22.0);
             ui.painter().circle_filled(c, 18.0, ACCENT);
@@ -803,7 +874,24 @@ impl MeduzaApp {
                     Self::get_texture(&mut self.img_cache, &p, ui.ctx(), &t.media_id, &t.thumbnail_url)
                 } else { None };
 
-                draw_vinyl_record(ui, art_rect.center(), 24.0, tex_opt, self.disc_angle);
+                if let Some(texture) = tex_opt {
+                    ui.painter().image(
+                        texture.id(),
+                        art_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                    ui.painter().rect_stroke(art_rect, Rounding::same(6.0), Stroke::new(1.0_f32, Color32::from_rgb(45, 45, 50)));
+                } else {
+                    ui.painter().rect_filled(art_rect, Rounding::same(6.0), BG_CARD);
+                    ui.painter().text(
+                        art_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "♪",
+                        FontId::proportional(20.0),
+                        T_DIM,
+                    );
+                }
 
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
@@ -831,7 +919,7 @@ impl MeduzaApp {
                 if let Some(ref t) = track {
                     ui.add_space(8.0);
                     let is_liked  = self.playback.is_liked(&t.media_id);
-                    let heart_ico = if is_liked { "❤️" } else { "♡" };
+                    let heart_ico = if is_liked { "♥" } else { "♡" };
                     let heart_col = if is_liked { Color32::from_rgb(255, 45, 85) } else { T_SEC };
                     if ui.add(egui::Button::new(
                         RichText::new(heart_ico).color(heart_col).font(FontId::proportional(16.0)))
@@ -1167,7 +1255,7 @@ impl MeduzaApp {
 
                 draw_vinyl_record(ui, vinyl_center, radius, tex_opt, self.disc_angle);
 
-                // ── 3. Title & Artist + Heart (Enlarged Fonts) ────────────────
+                // ── 3. Title & Artist (Centered) ──────────────────────────────
                 if let Some(ref t) = track {
                     ui.painter().text(
                         egui::pos2(cx, cy + 60.0),
@@ -1183,19 +1271,6 @@ impl MeduzaApp {
                         FontId::proportional(17.0),
                         T_SEC,
                     );
-
-                    let heart_r = egui::Rect::from_center_size(
-                        egui::pos2(cx + 240.0, cy + 76.0),
-                        Vec2::splat(36.0),
-                    );
-                    let is_liked  = self.playback.is_liked(&t.media_id);
-                    let heart_ico = if is_liked { "❤️" } else { "♡" };
-                    let heart_col = if is_liked { Color32::from_rgb(255, 45, 85) } else { T_SEC };
-                    if ui.put(heart_r, egui::Button::new(
-                        RichText::new(heart_ico).color(heart_col).font(FontId::proportional(26.0))
-                    ).frame(false)).clicked() {
-                        self.playback.toggle_like(t.clone());
-                    }
                 } else {
                     ui.painter().text(
                         egui::pos2(cx, cy + 75.0),
@@ -1316,6 +1391,22 @@ impl MeduzaApp {
                     RichText::new(rep_icon).color(rep_color).font(FontId::proportional(22.0))).frame(false);
                 if ui.put(rep_r, rep_btn).on_hover_text("Repeat").clicked() {
                     self.playback.toggle_repeat();
+                }
+
+                // Heart Like Button (Moved directly to transport row beside Repeat)
+                if let Some(ref t) = track {
+                    let heart_r = egui::Rect::from_center_size(
+                        egui::pos2(cx + 210.0, ctrl_y),
+                        Vec2::splat(40.0),
+                    );
+                    let is_liked  = self.playback.is_liked(&t.media_id);
+                    let heart_ico = if is_liked { "♥" } else { "♡" };
+                    let heart_col = if is_liked { Color32::from_rgb(255, 45, 85) } else { T_SEC };
+                    if ui.put(heart_r, egui::Button::new(
+                        RichText::new(heart_ico).color(heart_col).font(FontId::proportional(22.0))
+                    ).frame(false)).on_hover_text("Save to Library").clicked() {
+                        self.playback.toggle_like(t.clone());
+                    }
                 }
 
                 // ── 6. Full Screen Volume Control Bar ─────────────────────────
@@ -1456,14 +1547,15 @@ fn draw_vinyl_record(
     tex: Option<&egui::TextureHandle>,
     angle: f32,
 ) {
-    // 1. Black Vinyl Disk body
-    ui.painter().circle_filled(center, radius, Color32::from_rgb(16, 16, 18));
-    ui.painter().circle_stroke(center, radius, Stroke::new(2.5_f32, Color32::from_rgb(42, 42, 46)));
+    // 1. Black Outer Vinyl Disc Body
+    ui.painter().circle_filled(center, radius, Color32::from_rgb(14, 14, 16));
+    ui.painter().circle_stroke(center, radius, Stroke::new(2.5_f32, Color32::from_rgb(38, 38, 42)));
 
-    // 2. Concentric grooves around outer vinyl record body
-    let groove_min = radius * 0.52;
+    // 2. Outer Vinyl Record Grooves
+    let label_r = radius * 0.83;
+    let groove_min = label_r + 3.0;
     let groove_max = radius * 0.95;
-    let num_grooves = 7;
+    let num_grooves = 3;
     let step = (groove_max - groove_min) / (num_grooves as f32);
     for i in 0..num_grooves {
         let r = groove_min + (i as f32) * step;
@@ -1474,9 +1566,9 @@ fn draw_vinyl_record(
         );
     }
 
-    // 3. Rotating sheen (light reflections on spinning vinyl)
+    // 3. Rotating Light Sheen Reflections
     for &a in &[angle, angle + std::f32::consts::PI] {
-        let p1 = center + egui::vec2(a.cos(), a.sin()) * (radius * 0.50);
+        let p1 = center + egui::vec2(a.cos(), a.sin()) * (label_r + 2.0);
         let p2 = center + egui::vec2(a.cos(), a.sin()) * (radius * 0.96);
         ui.painter().line_segment(
             [p1, p2],
@@ -1484,43 +1576,49 @@ fn draw_vinyl_record(
         );
     }
 
-    // 4. SINGLE ROTATING ALBUM ART CARD (SMALLER 48% RADIUS, CLIPPED CARD ANIMATION)
-    let art_r = radius * 0.48;
-    let label_rect = egui::Rect::from_center_size(center, Vec2::splat(art_r * 2.0));
-
+    // 4. CIRCULAR ALBUM ARTWORK VINYL RECORD LABEL (WRAPPED SMOOTHLY ONTO CENTER DISC)
     if let Some(texture) = tex {
         let mut mesh = egui::Mesh::with_texture(texture.id());
-        let cos_a = angle.cos();
-        let sin_a = angle.sin();
-        let corners = [
-            egui::vec2(-art_r, -art_r),
-            egui::vec2(art_r, -art_r),
-            egui::vec2(art_r, art_r),
-            egui::vec2(-art_r, art_r),
-        ];
-        let uvs = [
-            egui::pos2(0.0, 0.0),
-            egui::pos2(1.0, 0.0),
-            egui::pos2(1.0, 1.0),
-            egui::pos2(0.0, 1.0),
-        ];
-        for i in 0..4 {
-            let rot_v = egui::vec2(
-                corners[i].x * cos_a - corners[i].y * sin_a,
-                corners[i].x * sin_a + corners[i].y * cos_a,
-            );
+        
+        // Center vertex
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: egui::pos2(0.5, 0.5),
+            color: Color32::WHITE,
+        });
+
+        // 64 segment circular fan perimeter
+        let segments = 64;
+        for i in 0..segments {
+            let frac = (i as f32) / (segments as f32);
+            let theta = frac * 2.0 * std::f32::consts::PI;
+            let rot_theta = theta + angle;
+            
+            let pos = center + egui::vec2(rot_theta.cos(), rot_theta.sin()) * label_r;
+            let uv_x = 0.5 + 0.5 * theta.cos();
+            let uv_y = 0.5 + 0.5 * theta.sin();
+
             mesh.vertices.push(egui::epaint::Vertex {
-                pos: center + rot_v,
-                uv: uvs[i],
+                pos,
+                uv: egui::pos2(uv_x, uv_y),
                 color: Color32::WHITE,
             });
         }
-        mesh.add_triangle(0, 1, 2);
-        mesh.add_triangle(0, 2, 3);
 
-        ui.painter().with_clip_rect(label_rect).add(mesh);
+        // Add fan triangles
+        for i in 1..=segments {
+            let next = if i == segments { 1 } else { (i + 1) as u32 };
+            mesh.add_triangle(0, i as u32, next);
+        }
+
+        ui.painter().add(mesh);
+        ui.painter().circle_stroke(
+            center,
+            label_r,
+            Stroke::new(2.0_f32, Color32::from_rgb(35, 35, 40)),
+        );
     } else {
-        ui.painter().circle_filled(center, art_r, BG_CARD);
+        ui.painter().circle_filled(center, label_r, BG_CARD);
         ui.painter().text(
             center,
             egui::Align2::CENTER_CENTER,

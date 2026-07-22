@@ -256,7 +256,8 @@ impl InnerTubeClient {
         sections
     }
 
-    /// Fetch home + explore + charts + moods + trending in parallel, merge all sections.
+    /// Fetch home + explore + charts + moods + trending in parallel.
+    /// Enriches with rich Spotify-style playlist category shelves!
     pub async fn fetch_home_feed(&self) -> Vec<BrowseSection> {
         let (explore, home, trending, charts, moods) = tokio::join!(
             self.fetch_browse("FEmusic_explore"),
@@ -271,11 +272,38 @@ impl InnerTubeClient {
         all.extend(charts);
         all.extend(trending);
         all.extend(moods);
+
         // Deduplicate sections by title
         let mut seen = std::collections::HashSet::new();
         all.retain(|s| seen.insert(s.title.clone()));
         // Filter out empty-title sections
         all.retain(|s| !s.title.is_empty() && !s.items.is_empty());
+
+        // Spotify-style category shelves enrichment
+        let (top, lofi, workout, viral, acoustic) = tokio::join!(
+            self.search_tracks("Top Global Hits"),
+            self.search_tracks("Chill Lofi Study Beats"),
+            self.search_tracks("Workout Dance Hype"),
+            self.search_tracks("Viral Hits TikTok Trending"),
+            self.search_tracks("Acoustic Indie Favorites"),
+        );
+
+        if !top.is_empty() {
+            all.push(BrowseSection { title: "🔥 Top Hits & Charting".to_string(), items: top });
+        }
+        if !lofi.is_empty() {
+            all.push(BrowseSection { title: "🎧 Chill & Lofi Beats".to_string(), items: lofi });
+        }
+        if !workout.is_empty() {
+            all.push(BrowseSection { title: "⚡ High Energy & Workout".to_string(), items: workout });
+        }
+        if !viral.is_empty() {
+            all.push(BrowseSection { title: "🌟 Viral & Trending Today".to_string(), items: viral });
+        }
+        if !acoustic.is_empty() {
+            all.push(BrowseSection { title: "🎸 Acoustic & Indie Jams".to_string(), items: acoustic });
+        }
+
         all
     }
 
@@ -372,6 +400,12 @@ impl InnerTubeClient {
                 }
             }
         }
+
+        if tracks.is_empty() {
+            println!("[InnerTube] Radio fallback search for {}", video_id);
+            tracks = self.search_tracks("Top Music Hits Mix").await;
+        }
+
         println!("[InnerTube] radio({}) → {} tracks", video_id, tracks.len());
         tracks
     }
