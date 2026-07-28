@@ -14,6 +14,8 @@
 # Build & Packaging Artifacts
 /build/
 /build-dir/
+/repo/
+repo/
 .flatpak-build/
 .flatpak-builder/
 .flatpak-repo/
