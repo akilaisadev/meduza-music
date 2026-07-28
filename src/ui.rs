@@ -175,36 +175,38 @@ impl MeduzaApp {
         #[cfg(target_os = "linux")]
         let _ = gtk::init();
 
-        let tray_menu = tray_icon::menu::Menu::new();
-        let item_show = tray_icon::menu::MenuItem::with_id("show", "Show Meduza", true, None);
-        let item_play = tray_icon::menu::MenuItem::with_id("play", "Play/Pause", true, None);
-        let item_quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
-        let _ = tray_menu.append_items(&[
-            &item_show,
-            &item_play,
-            &tray_icon::menu::PredefinedMenuItem::separator(),
-            &item_quit,
-        ]);
+        let tray_icon = std::panic::catch_unwind(|| {
+            let tray_menu = tray_icon::menu::Menu::new();
+            let item_show = tray_icon::menu::MenuItem::with_id("show", "Show App", true, None);
+            let item_play = tray_icon::menu::MenuItem::with_id("play", "Play/Pause", true, None);
+            let item_quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
+            let _ = tray_menu.append_items(&[
+                &item_show,
+                &item_play,
+                &tray_icon::menu::PredefinedMenuItem::separator(),
+                &item_quit,
+            ]);
 
-        let icon_data = include_bytes!("../assets/icon.png");
-        let tray_icon_img = if let Ok(img) = image::load_from_memory(icon_data) {
-            let rgba = img.into_rgba8();
-            let (w, h) = rgba.dimensions();
-            tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
-        } else {
-            None
-        };
+            let icon_data = include_bytes!("../assets/icon.png");
+            let tray_icon_img = if let Ok(img) = image::load_from_memory(icon_data) {
+                let rgba = img.into_rgba8();
+                let (w, h) = rgba.dimensions();
+                tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+            } else {
+                None
+            };
 
-        let tray_icon = if let Some(ic) = tray_icon_img {
-            tray_icon::TrayIconBuilder::new()
-                .with_menu(Box::new(tray_menu))
-                .with_tooltip("Meduza Music")
-                .with_icon(ic)
-                .build()
-                .ok()
-        } else {
-            None
-        };
+            if let Some(ic) = tray_icon_img {
+                tray_icon::TrayIconBuilder::new()
+                    .with_menu(Box::new(tray_menu))
+                    .with_tooltip("Meduza Music")
+                    .with_icon(ic)
+                    .build()
+                    .ok()
+            } else {
+                None
+            }
+        }).unwrap_or(None);
 
         Self {
             innertube, playback, runtime,
@@ -1904,8 +1906,8 @@ impl eframe::App for MeduzaApp {
             }
         }
 
-        // Intercept window close (X button) to hide to tray instead
-        if ctx.input(|i| i.viewport().close_requested()) && !self.is_exiting {
+        // Intercept window close (X button) to hide to tray instead (only if system tray icon exists)
+        if self._tray_icon.is_some() && ctx.input(|i| i.viewport().close_requested()) && !self.is_exiting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
