@@ -12,12 +12,26 @@ pub enum AudioQuality {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub audio_quality: AudioQuality,
+    pub enable_cache: bool,
+    pub gapless_playback: bool,
+    pub autoplay_radio: bool,
+    pub preload_next_track: bool,
+    pub normalize_volume: bool,
+    pub low_end_mode: bool,
+    pub max_cache_size_mb: u64,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             audio_quality: AudioQuality::High,
+            enable_cache: true,
+            gapless_playback: true,
+            autoplay_radio: true,
+            preload_next_track: true,
+            normalize_volume: true,
+            low_end_mode: false,
+            max_cache_size_mb: 500,
         }
     }
 }

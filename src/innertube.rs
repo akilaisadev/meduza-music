@@ -154,17 +154,38 @@ impl InnerTubeClient {
             ["text"]["runs"][0]["text"].as_str().unwrap_or("").to_string();
         if title.is_empty() { return None; }
 
-        // Artist = second flex column first run OR first flex column second run
-        let artist = r["flexColumns"][1]["musicResponsiveListItemFlexColumnRenderer"]
-            ["text"]["runs"][0]["text"].as_str()
-            .or_else(|| r["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]
-                ["text"]["runs"][2]["text"].as_str())
-            .unwrap_or("").to_string();
+        // Extract artist by joining text runs from the second flex column, skipping metadata labels
+        let mut artist = String::new();
+        if let Some(runs) = r["flexColumns"][1]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"].as_array() {
+            let mut parts = Vec::new();
+            for run in runs {
+                if let Some(txt) = run["text"].as_str() {
+                    let t = txt.trim();
+                    if !t.is_empty() && t != "•" && t != "&" && t != "Song" && t != "Video" && t != "EP" && t != "Single" && t != "Album" {
+                        parts.push(t);
+                    }
+                }
+            }
+            artist = parts.join(", ");
+        }
+        
+        // Fallback to first flex column (if it's a playlist track etc.)
+        if artist.is_empty() {
+            artist = r["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]
+                ["text"]["runs"][2]["text"].as_str()
+                .unwrap_or("Unknown Artist").to_string();
+        }
 
         // Duration from fixed column
         let dur_str = r["fixedColumns"][0]["musicResponsiveListItemFixedColumnRenderer"]
             ["text"]["runs"][0]["text"].as_str().unwrap_or("");
         let duration_seconds = Self::parse_duration(dur_str);
+
+        let tl = title.to_lowercase();
+        let al = artist.to_lowercase();
+        if tl.contains("podcast") || tl.contains("episode") || al.contains("podcast") || al.contains("episode") {
+            return None;
+        }
 
         let thumbnail_url = Self::thumbnail(r, &vid);
         Some(TrackItem { title, artist, media_id: vid, thumbnail_url, duration_seconds })
@@ -177,6 +198,13 @@ impl InnerTubeClient {
         let title = Self::text_run(&r["title"]["runs"]);
         if title.is_empty() { return None; }
         let artist = Self::text_run(&r["subtitle"]["runs"]);
+
+        let tl = title.to_lowercase();
+        let al = artist.to_lowercase();
+        if tl.contains("podcast") || tl.contains("episode") || al.contains("podcast") || al.contains("episode") {
+            return None;
+        }
+
         let thumbnail_url = Self::thumbnail(r, &vid);
         Some(TrackItem { title, artist, media_id: vid, thumbnail_url, duration_seconds: 0 })
     }

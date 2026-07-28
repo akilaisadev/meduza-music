@@ -13,7 +13,6 @@ const BG_TOP:     Color32 = Color32::from_rgb(14, 14, 14);
 const BG_CARD:    Color32 = Color32::from_rgb(22, 22, 22);
 const BG_CARD_HV: Color32 = Color32::from_rgb(32, 32, 32);
 const ACCENT:     Color32 = Color32::from_rgb(29, 185, 84);
-const ACCENT_DIM: Color32 = Color32::from_rgb(20, 140, 60);
 
 const T_PRI:      Color32 = Color32::from_rgb(255, 255, 255);
 const T_SEC:      Color32 = Color32::from_rgb(170, 170, 170);
@@ -47,6 +46,10 @@ pub struct MeduzaApp {
     img_cache:    HashMap<String, egui::TextureHandle>,
     img_pending:  Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
     logo_texture: Option<egui::TextureHandle>,
+    // System Tray
+    _tray_icon: Option<tray_icon::TrayIcon>,
+    is_exiting: bool,
+    
     show_now_playing: bool,
     disc_angle: f32,
 }
@@ -84,7 +87,9 @@ impl MeduzaApp {
         style.visuals.widgets.inactive.rounding = 8.0.into();
         style.visuals.widgets.hovered.rounding = 8.0.into();
         style.visuals.widgets.active.rounding = 8.0.into();
-        style.spacing.scroll.bar_width = 8.0;
+        style.spacing.scroll.bar_width = 12.0;
+        style.spacing.scroll.handle_min_length = 40.0;
+        style.visuals.widgets.inactive.bg_fill = Color32::from_gray(60);
         cc.egui_ctx.set_style(style);
 
         let innertube = Arc::new(InnerTubeClient::new());
@@ -93,13 +98,64 @@ impl MeduzaApp {
         let sections = Arc::new(Mutex::new(Vec::<BrowseSection>::new()));
         let loading  = Arc::new(Mutex::new(true));
 
+        // Load home feed cache instantly
+        let home_cache_path = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("meduza-music").join("home_cache.json");
+        
+        if let Ok(data) = std::fs::read_to_string(&home_cache_path) {
+            if let Ok(cached_feed) = serde_json::from_str::<Vec<BrowseSection>>(&data) {
+                if !cached_feed.is_empty() {
+                    *sections.lock().unwrap() = cached_feed;
+                    *loading.lock().unwrap() = false;
+                }
+            }
+        }
+
         {
             let s = Arc::clone(&sections);
             let l = Arc::clone(&loading);
             let it = Arc::clone(&innertube);
+            let engine = Arc::clone(&playback.recommendation_engine);
             runtime.spawn(async move {
-                let feed = it.fetch_home_feed().await;
-                *s.lock().unwrap() = feed;
+                let mut feed = Vec::new();
+                
+                let top_artist = engine.lock().unwrap().get_top_artist();
+                let top_tracks = engine.lock().unwrap().get_heavy_rotation(10);
+                
+                if !top_tracks.is_empty() {
+                    feed.push(BrowseSection {
+                        title: "Jump back in".to_string(),
+                        items: top_tracks.clone(),
+                    });
+                }
+                
+                if let Some(top_track) = top_tracks.first() {
+                    let radio = it.fetch_next_radio(&top_track.media_id).await;
+                    if !radio.is_empty() {
+                        feed.push(BrowseSection {
+                            title: format!("Because you listen to {}", top_track.artist),
+                            items: radio,
+                        });
+                    }
+                }
+                
+                if let Some(artist) = top_artist {
+                    let artist_mix = it.search_tracks(&format!("{} mix", artist)).await;
+                    if !artist_mix.is_empty() {
+                        feed.push(BrowseSection {
+                            title: format!("{} & Similar Artists", artist),
+                            items: artist_mix,
+                        });
+                    }
+                }
+                
+                let std_feed = it.fetch_home_feed().await;
+                feed.extend(std_feed);
+
+                if !feed.is_empty() {
+                    let _ = std::fs::write(&home_cache_path, serde_json::to_string(&feed).unwrap_or_default());
+                    *s.lock().unwrap() = feed;
+                }
                 *l.lock().unwrap() = false;
             });
         }
@@ -111,6 +167,41 @@ impl MeduzaApp {
             let (w, h) = rgba.dimensions();
             let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
             Some(cc.egui_ctx.load_texture("app_logo", ci, egui::TextureOptions::LINEAR))
+        } else {
+            None
+        };
+
+        // System Tray Initialization
+        #[cfg(target_os = "linux")]
+        let _ = gtk::init();
+
+        let tray_menu = tray_icon::menu::Menu::new();
+        let item_show = tray_icon::menu::MenuItem::with_id("show", "Show Meduza", true, None);
+        let item_play = tray_icon::menu::MenuItem::with_id("play", "Play/Pause", true, None);
+        let item_quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
+        let _ = tray_menu.append_items(&[
+            &item_show,
+            &item_play,
+            &tray_icon::menu::PredefinedMenuItem::separator(),
+            &item_quit,
+        ]);
+
+        let icon_data = include_bytes!("../assets/icon.png");
+        let tray_icon_img = if let Ok(img) = image::load_from_memory(icon_data) {
+            let rgba = img.into_rgba8();
+            let (w, h) = rgba.dimensions();
+            tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+        } else {
+            None
+        };
+
+        let tray_icon = if let Some(ic) = tray_icon_img {
+            tray_icon::TrayIconBuilder::new()
+                .with_menu(Box::new(tray_menu))
+                .with_tooltip("Meduza Music")
+                .with_icon(ic)
+                .build()
+                .ok()
         } else {
             None
         };
@@ -128,12 +219,21 @@ impl MeduzaApp {
             img_cache:      HashMap::new(),
             img_pending:    Arc::new(Mutex::new(HashMap::new())),
             logo_texture,
+            _tray_icon:     tray_icon,
+            is_exiting:     false,
             show_now_playing: false,
             disc_angle: 0.0,
         }
     }
 
     // ── Image loading ─────────────────────────────────────────────────────────
+
+    fn image_cache_dir() -> std::path::PathBuf {
+        let d = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join("meduza-music").join("images");
+        std::fs::create_dir_all(&d).ok();
+        d
+    }
 
     fn queue_image(id: &str, url: &str, pending: &Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>) {
         let mut p = pending.lock().unwrap();
@@ -143,11 +243,24 @@ impl MeduzaApp {
         let url2 = url.to_string();
         let p2   = Arc::clone(pending);
         thread::spawn(move || {
+            use std::io::Read;
+            use std::hash::{Hash, Hasher};
+            use std::collections::hash_map::DefaultHasher;
+            
+            let mut hasher = DefaultHasher::new();
+            id2.hash(&mut hasher);
+            let cache_file = Self::image_cache_dir().join(format!("{}.img", hasher.finish()));
+            
+            if let Ok(buf) = std::fs::read(&cache_file) {
+                p2.lock().unwrap().insert(id2, Some(buf));
+                return;
+            }
+
             if let Ok(resp) = ureq::get(&url2).call() {
                 let mut buf = Vec::new();
-                use std::io::Read;
                 let _ = resp.into_reader().take(5 * 1024 * 1024).read_to_end(&mut buf);
                 if !buf.is_empty() {
+                    let _ = std::fs::write(&cache_file, &buf);
                     p2.lock().unwrap().insert(id2, Some(buf));
                 }
             }
@@ -283,8 +396,16 @@ impl MeduzaApp {
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.horizontal(|ui| {
+                    use chrono::Timelike;
+                    let hour = chrono::Local::now().hour();
+                    let greeting = match hour {
+                        5..=11 => "Good Morning 🎵",
+                        12..=17 => "Good Afternoon 🎵",
+                        18..=21 => "Good Evening 🎵",
+                        _ => "Good Night 🎵",
+                    };
                     let title = match self.tab {
-                        Tab::Home    => "Good Evening 🎵",
+                        Tab::Home    => greeting,
                         Tab::Search  => "Search",
                         Tab::Library => "Your Library",
                         Tab::Settings => "Settings",
@@ -356,8 +477,6 @@ impl MeduzaApp {
         let liked_raw     = self.playback.liked_songs.lock().unwrap().clone();
         let liked         = crate::recommendation_engine::RecommendationEngine::filter_unique(&liked_raw, &mut seen);
 
-        let top_artist    = self.playback.recommendation_engine.lock().unwrap().get_top_artist();
-
         if loading && sections.is_empty() && history.is_empty() && heavy_rot.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
@@ -380,8 +499,43 @@ impl MeduzaApp {
                     let s  = Arc::clone(&self.sections);
                     let l  = Arc::clone(&self.is_loading_home);
                     let it = Arc::clone(&self.innertube);
+                    let engine = Arc::clone(&self.playback.recommendation_engine);
                     self.runtime.spawn(async move {
-                        let feed = it.fetch_home_feed().await;
+                        let mut feed = Vec::new();
+                        
+                        let top_artist = engine.lock().unwrap().get_top_artist();
+                        let top_tracks = engine.lock().unwrap().get_heavy_rotation(10);
+                        
+                        if !top_tracks.is_empty() {
+                            feed.push(BrowseSection {
+                                title: "Jump back in".to_string(),
+                                items: top_tracks.clone(),
+                            });
+                        }
+                        
+                        if let Some(top_track) = top_tracks.first() {
+                            let radio = it.fetch_next_radio(&top_track.media_id).await;
+                            if !radio.is_empty() {
+                                feed.push(BrowseSection {
+                                    title: format!("Because you listen to {}", top_track.artist),
+                                    items: radio,
+                                });
+                            }
+                        }
+                        
+                        if let Some(artist) = top_artist {
+                            let artist_mix = it.search_tracks(&format!("{} mix", artist)).await;
+                            if !artist_mix.is_empty() {
+                                feed.push(BrowseSection {
+                                    title: format!("{} & Similar Artists", artist),
+                                    items: artist_mix,
+                                });
+                            }
+                        }
+                        
+                        let std_feed = it.fetch_home_feed().await;
+                        feed.extend(std_feed);
+
                         *s.lock().unwrap() = feed;
                         *l.lock().unwrap() = false;
                     });
@@ -392,59 +546,12 @@ impl MeduzaApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_source("home")
             .show(ui, |ui| {
                 ui.add_space(8.0);
 
-                // 1. Recommendation Engine: Your Heavy Rotation
-                if !heavy_rot.is_empty() {
-                    ui.label(
-                        RichText::new("🔥 Your Heavy Rotation ⚡")
-                            .color(T_PRI)
-                            .font(FontId::proportional(19.0))
-                            .strong(),
-                    );
-                    ui.add_space(10.0);
-                    self.card_grid(ui, &heavy_rot);
-                    ui.add_space(26.0);
-                }
-
-                // 2. Dynamic Taste Section: Recently Played (Deduplicated)
-                if !history.is_empty() {
-                    ui.label(
-                        RichText::new("Recently Played 🎧")
-                            .color(T_PRI)
-                            .font(FontId::proportional(19.0))
-                            .strong(),
-                    );
-                    ui.add_space(10.0);
-                    self.card_grid(ui, &history);
-                    ui.add_space(26.0);
-                }
-
-                // 3. Dynamic Taste Section: Top Artist Mix
-                if let Some(ref artist) = top_artist {
-                    ui.label(
-                        RichText::new(format!("💡 More Like {} ✨", artist))
-                            .color(T_PRI)
-                            .font(FontId::proportional(19.0))
-                            .strong(),
-                    );
-                    ui.add_space(10.0);
-                }
-
-                // 4. Dynamic Taste Section: Rediscover Favorites
-                if !liked.is_empty() {
-                    ui.label(
-                        RichText::new("Rediscover Your Favorites ❤️")
-                            .color(T_PRI)
-                            .font(FontId::proportional(19.0))
-                            .strong(),
-                    );
-                    ui.add_space(10.0);
-                    self.card_grid(ui, &liked);
-                    ui.add_space(26.0);
-                }
+                // All shelves (Personalized & Generic) are now synthesized into `sections` during network fetch.
 
                 // 5. InnerTube Discovery Feed Sections (Deduplicated)
                 for section in &sections {
@@ -677,6 +784,7 @@ impl MeduzaApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
             .id_source("search")
             .show(ui, |ui| {
                 ui.label(RichText::new(format!("{} results for \"{}\"",
@@ -799,7 +907,11 @@ impl MeduzaApp {
                     .color(T_SEC).font(FontId::proportional(13.0)));
             });
         } else {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .id_source("library")
+                .show(ui, |ui| {
                 ui.add_space(12.0);
                 ui.label(RichText::new("Liked Songs 💚")
                     .font(FontId::proportional(22.0)).strong());
@@ -1071,145 +1183,236 @@ impl MeduzaApp {
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(20.0);
-        ui.label(RichText::new("Data Saver & Quality").color(T_PRI).font(FontId::proportional(22.0)).strong());
-        ui.add_space(10.0);
-        
-        let mut quality = self.playback.settings.lock().unwrap().audio_quality;
-        let mut changed = false;
-
-        ui.horizontal(|ui| {
-            if ui.selectable_value(&mut quality, crate::settings::AudioQuality::DataSaver, "Data Saver (Low)").clicked() { changed = true; }
-            if ui.selectable_value(&mut quality, crate::settings::AudioQuality::Normal, "Normal (Medium)").clicked() { changed = true; }
-            if ui.selectable_value(&mut quality, crate::settings::AudioQuality::High, "High Quality").clicked() { changed = true; }
-        });
-
-        ui.add_space(10.0);
-        ui.label(RichText::new("Data Saver uses lower bitrate audio (approx 64-96kbps) to save bandwidth.")
-            .color(T_SEC).font(FontId::proportional(14.0)));
-
-        if changed {
-            let mut s = self.playback.settings.lock().unwrap();
-            s.audio_quality = quality;
-            s.save();
-        }
-
-        ui.add_space(35.0);
-        ui.separator();
-        ui.add_space(25.0);
-
-        ui.label(
-            RichText::new("About & Developer")
-                .color(T_PRI)
-                .font(FontId::proportional(20.0))
-                .strong(),
-        );
-        ui.add_space(12.0);
-
-        // Premium Full-Width Developer Showcase Card
-        egui::Frame::none()
-            .fill(Color32::from_rgb(22, 22, 26))
-            .rounding(Rounding::same(16.0))
-            .stroke(Stroke::new(1.2_f32, Color32::from_rgb(45, 45, 52)))
-            .inner_margin(egui::Margin::same(24.0))
+        egui::ScrollArea::vertical()
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .id_source("settings_scroll")
             .show(ui, |ui| {
+                ui.add_space(16.0);
+                ui.label(
+                    RichText::new("Settings Control Center")
+                        .color(T_PRI)
+                        .font(FontId::proportional(24.0))
+                        .strong(),
+                );
+                ui.add_space(16.0);
+
+                let mut settings = self.playback.settings.lock().unwrap().clone();
+                let mut changed  = false;
+
+                // ── 1. Audio Quality & Bitrate ──────────────────────────────
+                ui.label(RichText::new("Audio Streaming Quality").color(T_PRI).font(FontId::proportional(16.0)).strong());
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    // Developer Icon Badge
-                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
-                    ui.painter().circle_filled(
-                        rect.center(),
-                        26.0,
-                        Color32::from_rgb(30, 215, 96), // ACCENT Green badge
-                    );
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "🎧",
-                        FontId::proportional(26.0),
-                        Color32::BLACK,
-                    );
+                    if ui.selectable_value(&mut settings.audio_quality, crate::settings::AudioQuality::DataSaver, "Data Saver (~1 MB/song)").clicked() { changed = true; }
+                    if ui.selectable_value(&mut settings.audio_quality, crate::settings::AudioQuality::Normal, "Normal (~3 MB/song)").clicked() { changed = true; }
+                    if ui.selectable_value(&mut settings.audio_quality, crate::settings::AudioQuality::High, "High Quality (~5 MB/song)").clicked() { changed = true; }
+                });
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(18.0);
 
+                // ── 2. Playback Engine & Autoplay Toggles ───────────────────
+                ui.label(RichText::new("Playback Engine & Performance").color(T_PRI).font(FontId::proportional(16.0)).strong());
+                ui.add_space(10.0);
+
+                if Self::render_setting_toggle_card(
+                    ui,
+                    "Seamless 0ms Gapless Advance",
+                    "Pre-buffers next track for instant zero-gap transitions.",
+                    &mut settings.gapless_playback,
+                ) { changed = true; }
+                ui.add_space(8.0);
+
+                if Self::render_setting_toggle_card(
+                    ui,
+                    "Infinite Autoplay Radio",
+                    "Automatically keeps playing related music when queue finishes.",
+                    &mut settings.autoplay_radio,
+                ) { changed = true; }
+                ui.add_space(8.0);
+
+                if Self::render_setting_toggle_card(
+                    ui,
+                    "RAM Stream Preloader",
+                    "Pre-resolves upcoming track stream URLs in background.",
+                    &mut settings.preload_next_track,
+                ) { changed = true; }
+                ui.add_space(8.0);
+
+                if Self::render_setting_toggle_card(
+                    ui,
+                    "Low-End Device Performance Mode",
+                    "Optimizes CPU & GPU memory usage for older PCs and low-spec hardware.",
+                    &mut settings.low_end_mode,
+                ) { changed = true; }
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(18.0);
+
+                // ── 3. Data Saver & Storage Cache Control ─────────────────
+                ui.label(RichText::new("Offline Storage & Data Saver").color(T_PRI).font(FontId::proportional(16.0)).strong());
+                ui.add_space(10.0);
+
+                if Self::render_setting_toggle_card(
+                    ui,
+                    "Enable Offline Audio Caching",
+                    "Saves streamed tracks locally so replays use 0 KB network data.",
+                    &mut settings.enable_cache,
+                ) { changed = true; }
+                ui.add_space(12.0);
+
+                let cache_size_mb = self.playback.data_saver.lock().unwrap().get_cache_size_mb();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Current Audio Cache: {:.1} MB", cache_size_mb)).color(T_SEC).font(FontId::proportional(14.0)));
                     ui.add_space(16.0);
+                    if ui.add(egui::Button::new(
+                        RichText::new("Clear Audio Cache").color(Color32::from_rgb(255, 100, 100)).font(FontId::proportional(13.0))
+                    ).fill(Color32::from_rgb(45, 20, 20)).rounding(Rounding::same(8.0))).clicked() {
+                        self.playback.data_saver.lock().unwrap().clear_cache();
+                    }
+                });
 
-                    ui.vertical(|ui| {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Max Storage Cap Limit:").color(T_SEC).font(FontId::proportional(14.0)));
+                    let mut cap_float = settings.max_cache_size_mb as f32;
+                    if ui.add(egui::Slider::new(&mut cap_float, 100.0..=5000.0).text("MB").step_by(100.0)).changed() {
+                        settings.max_cache_size_mb = cap_float as u64;
+                        changed = true;
+                    }
+                });
+                ui.label(RichText::new("Automatically purges oldest cached tracks when storage limit is reached.").color(T_DIM).font(FontId::proportional(12.0)));
+
+                ui.add_space(24.0);
+                ui.separator();
+                ui.add_space(24.0);
+
+                // ── 4. Developer Showcase Card ──────────────────────────────
+                ui.label(RichText::new("About & Developer").color(T_PRI).font(FontId::proportional(18.0)).strong());
+                ui.add_space(12.0);
+
+                egui::Frame::none()
+                    .fill(Color32::from_rgb(22, 22, 26))
+                    .rounding(Rounding::same(16.0))
+                    .stroke(Stroke::new(1.2_f32, Color32::from_rgb(45, 45, 52)))
+                    .inner_margin(egui::Margin::same(24.0))
+                    .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Meduza Music Player")
-                                    .color(T_PRI)
-                                    .font(FontId::proportional(18.0))
-                                    .strong(),
-                            );
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new("v0.2.0")
-                                    .color(T_DIM)
-                                    .font(FontId::proportional(13.0)),
-                            );
-                        });
+                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(52.0), Sense::hover());
+                            ui.painter().circle_filled(rect.center(), 26.0, ACCENT);
+                            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "♪", FontId::proportional(26.0), Color32::BLACK);
 
-                        ui.add_space(4.0);
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("Crafted with")
-                                    .color(T_SEC)
-                                    .font(FontId::proportional(14.0)),
-                            );
-                            ui.label(
-                                RichText::new("♥")
-                                    .color(Color32::from_rgb(255, 45, 85))
-                                    .font(FontId::proportional(16.0))
-                                    .strong(),
-                            );
-                            ui.label(
-                                RichText::new("by")
-                                    .color(T_SEC)
-                                    .font(FontId::proportional(14.0)),
-                            );
-                            ui.hyperlink_to(
-                                RichText::new("@akilaisadev")
-                                    .color(ACCENT)
-                                    .font(FontId::proportional(14.0))
-                                    .strong(),
-                                "https://github.com/akilaisadev",
-                            )
-                            .on_hover_text("Open https://github.com/akilaisadev");
-                        });
+                            ui.add_space(16.0);
 
-                        ui.add_space(14.0);
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Meduza Music Player").color(T_PRI).font(FontId::proportional(18.0)).strong());
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new("v0.2.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
+                                });
 
-                        // Hover Action Link Cards / Buttons
-                        ui.horizontal(|ui| {
-                            let gh_btn = egui::Button::new(
-                                RichText::new("🐙 GitHub Profile")
-                                    .color(T_PRI)
-                                    .font(FontId::proportional(13.0)),
-                            )
-                            .fill(Color32::from_rgb(34, 34, 40))
-                            .rounding(Rounding::same(8.0))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 55, 62)));
+                                ui.add_space(4.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("Crafted with").color(T_SEC).font(FontId::proportional(14.0)));
+                                    ui.label(RichText::new("♥").color(Color32::from_rgb(255, 45, 85)).font(FontId::proportional(16.0)).strong());
+                                    ui.label(RichText::new("by").color(T_SEC).font(FontId::proportional(14.0)));
+                                    ui.hyperlink_to(
+                                        RichText::new("@akilaisadev").color(ACCENT).font(FontId::proportional(14.0)).strong(),
+                                        "https://github.com/akilaisadev",
+                                    );
+                                });
 
-                            if ui.add(gh_btn).on_hover_text("Open https://github.com/akilaisadev").clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::same_tab("https://github.com/akilaisadev"));
-                            }
+                                ui.add_space(14.0);
 
-                            ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    let gh_btn = egui::Button::new(
+                                        RichText::new("GitHub Profile").color(T_PRI).font(FontId::proportional(13.0)),
+                                    )
+                                    .fill(Color32::from_rgb(34, 34, 40))
+                                    .rounding(Rounding::same(8.0))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 55, 62)));
 
-                            let repo_btn = egui::Button::new(
-                                RichText::new("⭐ Star Project")
-                                    .color(T_PRI)
-                                    .font(FontId::proportional(13.0)),
-                            )
-                            .fill(Color32::from_rgb(34, 34, 40))
-                            .rounding(Rounding::same(8.0))
-                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 55, 62)));
+                                    if ui.add(gh_btn).on_hover_text("Open https://github.com/akilaisadev").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::same_tab("https://github.com/akilaisadev"));
+                                    }
 
-                            if ui.add(repo_btn).on_hover_text("Open https://github.com/akilaisadev").clicked() {
-                                ui.ctx().open_url(egui::OpenUrl::same_tab("https://github.com/akilaisadev"));
-                            }
+                                    ui.add_space(10.0);
+
+                                    let repo_btn = egui::Button::new(
+                                        RichText::new("⭐ Star Project").color(T_PRI).font(FontId::proportional(13.0)),
+                                    )
+                                    .fill(Color32::from_rgb(34, 34, 40))
+                                    .rounding(Rounding::same(8.0))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(55, 55, 62)));
+
+                                    if ui.add(repo_btn).on_hover_text("Open https://github.com/akilaisadev/meduza-music").clicked() {
+                                        ui.ctx().open_url(egui::OpenUrl::same_tab("https://github.com/akilaisadev/meduza-music"));
+                                    }
+                                });
+                            });
                         });
                     });
-                });
+
+                if changed {
+                    settings.save();
+                    *self.playback.settings.lock().unwrap() = settings;
+                }
             });
+    }
+
+    fn render_setting_toggle_card(
+        ui: &mut egui::Ui,
+        title: &str,
+        description: &str,
+        value: &mut bool,
+    ) -> bool {
+        let mut changed = false;
+        let card_h = 56.0_f32;
+        let card_w = ui.available_width();
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(card_w, card_h), Sense::click());
+
+        let is_hover = resp.hovered();
+        let bg_col = if is_hover { Color32::from_rgb(32, 32, 38) } else { Color32::from_rgb(22, 22, 26) };
+        let stroke_col = if is_hover { Color32::from_rgb(60, 60, 70) } else { Color32::from_rgb(40, 40, 46) };
+
+        ui.painter().rect(rect, Rounding::same(12.0), bg_col, Stroke::new(1.0_f32, stroke_col));
+
+        if resp.clicked() {
+            *value = !*value;
+            changed = true;
+        }
+
+        // Title & Description on Left
+        let text_rect = egui::Rect::from_min_max(
+            rect.min + Vec2::new(16.0, 8.0),
+            rect.max - Vec2::new(60.0, 8.0),
+        );
+        ui.allocate_ui_at_rect(text_rect, |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(title).color(T_PRI).font(FontId::proportional(15.0)).strong());
+                ui.add_space(2.0);
+                ui.label(RichText::new(description).color(T_SEC).font(FontId::proportional(12.0)));
+            });
+        });
+
+        // Pill Toggle Switch on Right
+        let pill_w = 40.0_f32;
+        let pill_h = 22.0_f32;
+        let pill_pos = egui::pos2(rect.max.x - 52.0, rect.center().y - (pill_h / 2.0));
+        let pill_rect = egui::Rect::from_min_size(pill_pos, Vec2::new(pill_w, pill_h));
+
+        let active = *value;
+        let pill_bg = if active { ACCENT } else { Color32::from_rgb(50, 50, 56) };
+        ui.painter().rect_filled(pill_rect, Rounding::same(11.0), pill_bg);
+
+        // Knob
+        let knob_r = 8.0_f32;
+        let knob_x = if active { pill_rect.max.x - 11.0 } else { pill_rect.min.x + 11.0 };
+        let knob_pos = egui::pos2(knob_x, pill_rect.center().y);
+        let knob_col = if active { Color32::BLACK } else { Color32::from_rgb(180, 180, 180) };
+        ui.painter().circle_filled(knob_pos, knob_r, knob_col);
+
+        changed
     }
 
     fn show_now_playing_screen(&mut self, ctx: &egui::Context) {
@@ -1548,35 +1751,77 @@ fn draw_vinyl_record(
     angle: f32,
 ) {
     // 1. Black Outer Vinyl Disc Body
-    ui.painter().circle_filled(center, radius, Color32::from_rgb(14, 14, 16));
-    ui.painter().circle_stroke(center, radius, Stroke::new(2.5_f32, Color32::from_rgb(38, 38, 42)));
+    // Make the base brighter so it contrasts with the very dark background
+    ui.painter().circle_filled(center, radius, Color32::from_rgb(22, 22, 24));
+    ui.painter().circle_stroke(center, radius, Stroke::new(1.5_f32, Color32::from_rgb(45, 45, 50)));
 
-    // 2. Outer Vinyl Record Grooves
-    let label_r = radius * 0.83;
-    let groove_min = label_r + 3.0;
-    let groove_max = radius * 0.95;
-    let num_grooves = 3;
-    let step = (groove_max - groove_min) / (num_grooves as f32);
+    // 2. Realistic Outer Vinyl Record Grooves
+    let label_r = radius * 0.33; 
+    let groove_min = label_r + 4.0;
+    let groove_max = radius - 4.0;
+    
+    // Draw many subtle concentric circles to simulate grooves
+    let num_grooves = (radius * 0.3) as usize; 
+    let step = (groove_max - groove_min) / (num_grooves as f32).max(1.0);
+    
     for i in 0..num_grooves {
         let r = groove_min + (i as f32) * step;
+        // Make grooves brighter so they are visible
+        let brightness = if i % 7 == 0 { 42 } else if i % 3 == 0 { 32 } else { 26 };
         ui.painter().circle_stroke(
             center,
             r,
-            Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 14)),
+            Stroke::new(0.8_f32, Color32::from_rgb(brightness, brightness, brightness)),
         );
     }
 
-    // 3. Rotating Light Sheen Reflections
+    // 3. Light Sheen Reflections (Hourglass shape)
+    let sheen_color = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+    // Draw two opposite wedges
+    for &base_angle in &[-std::f32::consts::FRAC_PI_4, std::f32::consts::PI - std::f32::consts::FRAC_PI_4] {
+        let mut mesh = egui::Mesh::default();
+        let spread = 0.3_f32; // slightly wider sheen
+        
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: egui::pos2(0.5, 0.5),
+            color: sheen_color,
+        });
+        
+        let segments = 12;
+        for i in 0..=segments {
+            let frac = (i as f32) / (segments as f32);
+            let theta = base_angle - spread + (spread * 2.0 * frac);
+            
+            let pos = center + egui::vec2(theta.cos(), theta.sin()) * radius;
+            // The edge of the reflection fades out
+            let alpha = (1.0 - (frac - 0.5).abs() * 2.0) * 16.0; 
+            let edge_color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha as u8);
+            
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos,
+                uv: egui::pos2(0.5, 0.5),
+                color: edge_color,
+            });
+        }
+        
+        for i in 1..=segments {
+            mesh.add_triangle(0, i as u32, (i + 1) as u32);
+        }
+        ui.painter().add(mesh);
+    }
+
+    // Rotating specular highlight lines to give extra dimension when spinning
     for &a in &[angle, angle + std::f32::consts::PI] {
         let p1 = center + egui::vec2(a.cos(), a.sin()) * (label_r + 2.0);
-        let p2 = center + egui::vec2(a.cos(), a.sin()) * (radius * 0.96);
+        let p2 = center + egui::vec2(a.cos(), a.sin()) * (radius - 2.0);
         ui.painter().line_segment(
             [p1, p2],
-            Stroke::new(6.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+            Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 12)),
         );
     }
 
-    // 4. CIRCULAR ALBUM ARTWORK VINYL RECORD LABEL (WRAPPED SMOOTHLY ONTO CENTER DISC)
+    // 4. CIRCULAR ALBUM ARTWORK VINYL RECORD LABEL
     if let Some(texture) = tex {
         let mut mesh = egui::Mesh::with_texture(texture.id());
         
@@ -1618,13 +1863,19 @@ fn draw_vinyl_record(
             Stroke::new(2.0_f32, Color32::from_rgb(35, 35, 40)),
         );
     } else {
-        ui.painter().circle_filled(center, label_r, BG_CARD);
+        // Fallback realistic label look
+        ui.painter().circle_filled(center, label_r, Color32::from_rgb(180, 40, 40));
+        ui.painter().circle_stroke(
+            center,
+            label_r,
+            Stroke::new(2.0_f32, Color32::from_rgb(120, 20, 20)),
+        );
         ui.painter().text(
             center,
             egui::Align2::CENTER_CENTER,
             "♪",
-            FontId::proportional(radius * 0.35),
-            T_DIM,
+            FontId::proportional(label_r * 0.5),
+            Color32::from_rgb(240, 220, 220),
         );
     }
 }
@@ -1633,17 +1884,48 @@ fn draw_vinyl_record(
 
 impl eframe::App for MeduzaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Tray Event Handling
+        if let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+            match event.id.as_ref() {
+                "show" => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                },
+                "play" => self.playback.toggle_pause(),
+                "quit" => {
+                    self.is_exiting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                },
+                _ => {}
+            }
+        }
+
+        // Intercept window close (X button) to hide to tray instead
+        if ctx.input(|i| i.viewport().close_requested()) && !self.is_exiting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         // Handle auto advance
         self.playback.handle_auto_advance();
 
-        // Rotate vinyl record disc animation when playing
+        // Rotate vinyl record disc animation when playing (bypassed in Low-End Device Mode)
+        let is_low_end = self.playback.settings.lock().unwrap().low_end_mode;
         let st = self.playback.state.lock().unwrap().clone();
         if matches!(st, PlaybackState::Playing) {
-            self.disc_angle += 0.015;
-            if self.disc_angle > std::f32::consts::TAU * 100.0 {
-                self.disc_angle = 0.0;
+            if !is_low_end {
+                self.disc_angle += 0.015;
+                if self.disc_angle > std::f32::consts::TAU * 100.0 {
+                    self.disc_angle = 0.0;
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            } else {
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
             }
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         } else if matches!(st, PlaybackState::Loading) {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
         }
@@ -1658,19 +1940,26 @@ impl eframe::App for MeduzaApp {
             ctx.request_repaint();
         }
 
-        // ── Visuals ──────────────────────────────────────────────────────────
+        // ── Visuals & Scrollbar Styling ──────────────────────────────────────
         let mut vis = egui::Visuals::dark();
         vis.panel_fill                     = BG;
         vis.window_fill                    = BG;
         vis.override_text_color            = Some(T_PRI);
         vis.selection.bg_fill              = ACCENT;
         vis.widgets.noninteractive.bg_fill = BG_CARD;
-        vis.widgets.inactive.bg_fill       = BG_CARD;
-        vis.widgets.hovered.bg_fill        = BG_CARD_HV;
-        vis.widgets.active.bg_fill         = ACCENT_DIM;
+        vis.widgets.inactive.bg_fill       = Color32::from_rgb(50, 50, 62);
+        vis.widgets.hovered.bg_fill        = Color32::from_rgb(80, 80, 105);
+        vis.widgets.active.bg_fill         = ACCENT;
         vis.extreme_bg_color               = Color32::from_rgb(6, 6, 6);
         vis.widgets.inactive.fg_stroke     = Stroke::NONE;
         ctx.set_visuals(vis);
+
+        let mut style = (*ctx.style()).clone();
+        style.spacing.scroll.bar_width = 10.0;
+        style.spacing.scroll.handle_min_length = 36.0;
+        style.spacing.scroll.bar_inner_margin = 3.0;
+        style.spacing.scroll.bar_outer_margin = 3.0;
+        ctx.set_style(style);
 
         // ── Layout ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("player")

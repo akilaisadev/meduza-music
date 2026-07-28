@@ -23,9 +23,9 @@ impl StreamResolver {
         let url = format!("https://www.youtube.com/watch?v={}", video_id);
         
         let format_arg = match quality {
-            crate::settings::AudioQuality::DataSaver => "bestaudio[abr<=64]/bestaudio[abr<=96]/bestaudio[ext=webm]",
-            crate::settings::AudioQuality::Normal => "bestaudio[abr<=128]/bestaudio[ext=webm]",
-            crate::settings::AudioQuality::High => "bestaudio[ext=webm]/bestaudio/best",
+            crate::settings::AudioQuality::DataSaver => "bestaudio[acodec=opus][abr<=70]/bestaudio[abr<=96]/bestaudio[ext=webm]",
+            crate::settings::AudioQuality::Normal => "bestaudio[acodec=opus][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=webm]",
+            crate::settings::AudioQuality::High => "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
         };
 
         for browser in &["firefox", "chrome"] {
@@ -44,7 +44,11 @@ impl StreamResolver {
             if let Ok(out) = output {
                 if out.status.success() {
                     let raw = String::from_utf8_lossy(&out.stdout);
-                    let stream_url = raw.lines().next().unwrap_or("").trim().to_string();
+                    let stream_url = raw.lines()
+                        .find(|l| l.starts_with("http"))
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
                     if !stream_url.is_empty() {
                         println!("[StreamResolver] Resolved via {} cookies: {} ({})", browser, &stream_url[..stream_url.len().min(60)], video_id);
                         return Some(stream_url);

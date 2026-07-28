@@ -93,7 +93,6 @@ impl PlaybackManager {
         let queue_bg    = Arc::clone(&queue);
         let idx_bg      = Arc::clone(&queue_index);
         let cache_bg    = Arc::clone(&stream_cache);
-        let settings_bg = Arc::clone(&settings);
 
         thread::spawn(move || {
             loop {
@@ -145,28 +144,6 @@ impl PlaybackManager {
                         let mut end_flag = lk!(ended_bg);
                         if !*end_flag {
                             *end_flag = true;
-                            let q = lk!(queue_bg).clone();
-                            if !q.is_empty() {
-                                let mut idx_g = lk!(idx_bg);
-                                let next_idx = if *idx_g + 1 < q.len() { *idx_g + 1 } else { 0 };
-                                *idx_g = next_idx;
-                                let next_track = q[next_idx].track.clone();
-                                drop(idx_g);
-                                
-                                println!("[Playback] Track finished (eof-reached) — auto-playing next track: {}", next_track.title);
-                                *lk!(curr_bg)     = Some(next_track.clone());
-                                *lk!(duration_bg) = next_track.duration_seconds as f32;
-                                *lk!(progress_bg) = 0.0;
-                                *lk!(cache_bg)    = None;
-
-                                let quality = lk!(settings_bg).audio_quality;
-                                thread::spawn(move || {
-                                    if let Some(url) = crate::stream_resolver::StreamResolver::get_audio_url(&next_track.media_id, quality) {
-                                        ipc_send(serde_json::json!({"command": ["loadfile", url, "replace"]}));
-                                        ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
-                                    }
-                                });
-                            }
                         }
                     }
                 }
@@ -220,10 +197,12 @@ impl PlaybackManager {
         let mpv_proc     = Arc::clone(&self.mpv_process);
         let volume       = *lk!(self.volume);
         let video_id     = track.media_id.clone();
+        let title        = track.title.clone();
         let quality      = lk!(self.settings).audio_quality;
         let data_saver_c = Arc::clone(&self.data_saver);
         let reco_c       = Arc::clone(&self.recommendation_engine);
         let track_cl     = track.clone();
+        let settings_c   = Arc::clone(&self.settings);
 
         thread::spawn(move || {
             ensure_mpv_running(&mpv_proc);
@@ -233,7 +212,7 @@ impl PlaybackManager {
 
             // Check DataSaver local disk cache (0-data instant replay!)
             if let Some(cached_path) = lk!(data_saver_c).get_cached_file(&video_id) {
-                println!("[DataSaver] ZERO-DATA INSTANT PLAYBACK FROM DISK: {}", cached_path);
+                println!("[DataSaver] ZERO-DATA INSTANT PLAYBACK FROM DISK: '{}' ({})", title, cached_path);
                 ipc_send(serde_json::json!({"command": ["loadfile", cached_path, "replace"]}));
                 ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
                 ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
@@ -241,7 +220,7 @@ impl PlaybackManager {
                 return;
             }
 
-            println!("[Playback] Resolving stream for {}", video_id);
+            println!("[Playback] Resolving stream for '{}' ({})", title, video_id);
             let Some(url) = StreamResolver::get_audio_url(&video_id, quality) else {
                 *lk!(state_c) =
                     PlaybackState::Error("yt-dlp: could not resolve stream URL".to_string());
@@ -252,10 +231,16 @@ impl PlaybackManager {
             ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
             ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
             *lk!(state_c) = PlaybackState::Playing;
-            println!("[Playback] Streaming: {}", video_id);
+            println!("[Playback] Streaming: '{}' ({})", title, video_id);
 
-            // Cache stream to disk in background so future plays consume 0 data!
-            lk!(data_saver_c).cache_stream_in_bg(video_id, url);
+            // Cache stream to disk in background if enabled in settings
+            let (enable_cache, max_cap) = {
+                let s = lk!(settings_c);
+                (s.enable_cache, s.max_cache_size_mb)
+            };
+            if enable_cache {
+                lk!(data_saver_c).cache_stream_in_bg(video_id, url, max_cap);
+            }
         });
 
         // Immediately trigger background preloader (waits until Playing state)
@@ -315,17 +300,22 @@ impl PlaybackManager {
         let next_track = queue[next_idx].track.clone();
         drop(idx);
 
-        let has_cached = {
+        let cached_url = {
             let c = lk!(self.stream_cache);
-            if let Some((ref vid, _)) = *c {
-                vid == &next_track.media_id
-            } else { false }
+            if let Some((ref vid, ref url)) = *c {
+                if vid == &next_track.media_id {
+                    Some(url.clone())
+                } else { None }
+            } else { None }
         };
 
-        if has_cached {
-            ipc_send(serde_json::json!({"command": ["playlist-next"]}));
-            ipc_send(serde_json::json!({"command": ["playlist-remove", 0]}));
+        if let Some(url) = cached_url {
+            let volume = *lk!(self.volume);
+            ipc_send(serde_json::json!({"command": ["loadfile", url, "replace"]}));
+            ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
+            ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
             *lk!(self.current_track) = Some(next_track.clone());
+            *lk!(self.state)         = PlaybackState::Playing;
             *lk!(self.progress_secs) = 0.0;
             *lk!(self.duration_secs) = next_track.duration_seconds as f32;
             *lk!(self.track_ended)   = false;
@@ -379,38 +369,38 @@ impl PlaybackManager {
 
         let quality  = lk!(self.settings).audio_quality;
         let cache_c  = Arc::clone(&self.stream_cache);
+        let title    = track.title.clone();
 
         thread::spawn(move || {
             ensure_mpv_running(&mpv_proc);
-            println!("[Playback] Resolving stream for {}", video_id);
+            println!("[Playback] Resolving stream for '{}' ({})", title, video_id);
             
             let cached_url = {
                 let mut c = lk!(cache_c);
                 if let Some((vid, url)) = c.as_ref() {
                     if vid == &video_id {
-                        let u = url.clone();
+                        let res = url.clone();
                         *c = None;
-                        Some(u)
+                        Some(res)
                     } else { None }
                 } else { None }
             };
 
-            let url = if let Some(u) = cached_url {
-                u
+            let stream_url = if let Some(url) = cached_url {
+                println!("[Preloader] Instant load pre-resolved stream URL for '{}' ({})", title, video_id);
+                url
+            } else if let Some(url) = StreamResolver::get_audio_url(&video_id, quality) {
+                url
             } else {
-                let Some(u) = StreamResolver::get_audio_url(&video_id, quality) else {
-                    *lk!(state_c) =
-                        PlaybackState::Error("yt-dlp: could not resolve stream URL".to_string());
-                    return;
-                };
-                u
+                *lk!(state_c) = PlaybackState::Error("Could not resolve stream URL".to_string());
+                return;
             };
 
-            ipc_send(serde_json::json!({"command": ["loadfile", url, "replace"]}));
+            ipc_send(serde_json::json!({"command": ["loadfile", stream_url, "replace"]}));
             ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
             ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
             *lk!(state_c) = PlaybackState::Playing;
-            println!("[Playback] Streaming: {}", video_id);
+            println!("[Playback] Streaming: '{}' ({})", title, video_id);
         });
 
         self.trigger_background_preloader(track);
@@ -458,6 +448,7 @@ impl PlaybackManager {
             };
 
             let next_vid = q[next_idx].track.media_id.clone();
+            let next_title = q[next_idx].track.title.clone();
             drop(q);
 
             let c = lk!(cache_c);
@@ -465,11 +456,10 @@ impl PlaybackManager {
             drop(c);
 
             if needs_preload {
-                println!("[Preloader] Pre-resolving next track: {}", next_vid);
+                println!("[Preloader] Pre-resolving next track: '{}' ({})", next_title, next_vid);
                 if let Some(url) = StreamResolver::get_audio_url(&next_vid, quality) {
-                    *lk!(cache_c) = Some((next_vid, url.clone()));
-                    ipc_send(serde_json::json!({"command": ["loadfile", url, "append"]}));
-                    println!("[Preloader] Instant Engine: Pre-buffered next track to mpv queue.");
+                    *lk!(cache_c) = Some((next_vid, url));
+                    println!("[Preloader] Instant Engine: Pre-resolved next track URL.");
                 }
             }
         });
@@ -544,11 +534,14 @@ impl PlaybackManager {
 
 /// Fire-and-forget IPC send (no response read → always fast).
 fn ipc_send(cmd: serde_json::Value) {
-    let Ok(mut s) = UnixStream::connect(socket_path()) else { return; };
-    s.set_write_timeout(Some(Duration::from_millis(200))).ok();
-    let mut msg = cmd.to_string();
-    msg.push('\n');
-    let _ = s.write_all(msg.as_bytes());
+    std::thread::spawn(move || {
+        if let Ok(mut s) = UnixStream::connect(socket_path()) {
+            s.set_write_timeout(Some(Duration::from_millis(200))).ok();
+            let mut msg = cmd.to_string();
+            msg.push('\n');
+            let _ = s.write_all(msg.as_bytes());
+        }
+    });
 }
 
 /// Read a numeric property from mpv IPC. Called only from the background thread.
@@ -636,6 +629,7 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>) {
         .args([
             "--no-video",
             "--idle=yes",
+            "--keep-open=yes",
             "--terminal=no",
             "--no-input-default-bindings",
             &format!("--input-ipc-server={}", socket),
