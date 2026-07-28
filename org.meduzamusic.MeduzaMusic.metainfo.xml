@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.meduzamusic.MeduzaMusic</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Meduza Music</name>
+  <summary>Lightweight YouTube Music desktop client</summary>
+  <description>
+    <p>
+      Meduza Music is a blisteringly fast desktop music client for YouTube Music, built from scratch in Rust using GPU-accelerated egui and mpv live streaming.
+    </p>
+    <ul>
+      <li>Instant InnerTube API search</li>
+      <li>Zero-buffer live mpv audio streaming</li>
+      <li>Modern Spotify-inspired UI with smooth rounding</li>
+      <li>Endless radio queue &amp; shuffle/repeat support</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.meduzamusic.MeduzaMusic.desktop</launchable>
+  <content_rating type="oars-1.1" />
+</component>
