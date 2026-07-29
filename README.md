@@ -21,6 +21,13 @@
 
 ## 📸 Interface Showcase
 
+### 🎥 Video Demonstration
+Watch Meduza Music in action — streaming audio, spinning vinyl, and responsive dark UI:
+
+![Meduza Music Live Demo Video](images/demo_video.mp4)
+
+<br />
+
 ### 🏠 Home Discovery Feed
 Personalized shelves (*Jump back in*, *Heavy rotation*, *Listening history*, *Top Artists & Mixes*) with high-contrast, always-visible scrollbar UI.
 
