@@ -24,17 +24,20 @@ Welcome to the official **v1.0.0 release** of **Meduza Music**! Meduza Music is 
 
 ---
 
-### 📦 Installation Guide (Linux Flatpak)
+### 📦 Installation Guide (Linux AppImage)
 
-#### 1. Download the Bundle
-Download `meduza-music-v1.0.0.flatpak` attached below.
+#### 1. Download
+Download the latest `Meduza_Music-*-x86_64.AppImage` from the release assets.
 
-#### 2. Install
+#### 2. Make it executable & launch
 ```bash
-flatpak install --user meduza-music-v1.0.0.flatpak
+chmod +x Meduza_Music-*.AppImage
+./Meduza_Music-*.AppImage
 ```
 
-#### 3. Launch
-```bash
-flatpak run org.meduzamusic.MeduzaMusic
-```
+#### 3. Run from anywhere
+Move the AppImage to your `~/bin` folder (or any folder in `PATH`) so a
+`meduza-music` shell alias launches it from the terminal.
+
+> Note: AppImage is the only packaged format supported. For system-level
+> installs, build from source with `cargo build --release`.

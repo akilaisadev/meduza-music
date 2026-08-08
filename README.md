@@ -12,7 +12,6 @@
 <p align="center">
   <a href="https://github.com/akilaisadev/meduza-music/releases/latest"><img src="https://img.shields.io/github/v/release/akilaisadev/meduza-music?style=for-the-badge&color=1DB954" alt="Release" /></a>
   <a href="https://github.com/akilaisadev/meduza-music/stargazers"><img src="https://img.shields.io/github/stars/akilaisadev/meduza-music?style=for-the-badge&color=E95420" alt="Stars" /></a>
-  <a href="https://flathub.org"><img src="https://img.shields.io/badge/Platform-Linux%20%2F%20Flatpak-4A154B?style=for-the-badge&logo=flatpak" alt="Flatpak" /></a>
   <img src="https://img.shields.io/badge/Built%20With-Rust-000000?style=for-the-badge&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Audio-MPV%20IPC-044B94?style=for-the-badge" alt="MPV" />
 </p>
@@ -60,21 +59,23 @@ Toggle low-end hardware mode, seamless 0ms gapless preloader, offline caching, a
 
 ## 🚀 Installation & Usage
 
-### Option 1: Flatpak (Recommended)
+### Option 1: AppImage (Recommended)
 
-Download the latest `.flatpak` bundle from the [Releases Page](https://github.com/akilaisadev/meduza-music/releases/latest) and run:
+Download the latest `MeduzaMusic-*-x86_64.AppImage` from the [Releases Page](https://github.com/akilaisadev/meduza-music/releases/latest) and run:
 
 ```bash
-# 1. Install the Flatpak bundle
-flatpak install --user meduza-music-v1.0.0.flatpak
+# 1. Make it executable
+chmod +x Meduza_Music-*-x86_64.AppImage
 
 # 2. Launch Meduza Music
-flatpak run org.meduzamusic.MeduzaMusic
+./Meduza_Music-*-x86_64.AppImage
 ```
+
+AppImages are self-contained and do not require installation. Requires `mpv`, `python3` with `yt_dlp`, the GTK3 runtime, and FUSE (already present on most modern distros).
 
 ### Option 2: Build from Source (Cargo)
 
-Prerequisites: `cargo`, `mpv`, `gtk3`.
+Prerequisites: `cargo`, `mpv`, `python3` + `yt-dlp`, `gtk3`.
 
 ```bash
 # 1. Clone the repository
@@ -83,6 +84,12 @@ cd meduza-music
 
 # 2. Build and run in release mode
 cargo run --release
+```
+
+### Option 3: Package an AppImage yourself
+
+```bash
+./build_appimage.sh
 ```
 
 ---

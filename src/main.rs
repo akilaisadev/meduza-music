@@ -5,24 +5,16 @@ mod ui;
 pub mod settings;
 pub mod data_saver;
 pub mod recommendation_engine;
+mod workers;
 
 use eframe::{egui, NativeOptions};
 use ui::MeduzaApp;
 
 fn main() -> eframe::Result<()> {
-    // Build a Tokio runtime for async InnerTube calls
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(4)
-        .enable_all()
-        .build()
-        .expect("Failed to build Tokio runtime");
-
-    let handle = runtime.handle().clone();
-
-    // Keep runtime alive in background thread
-    std::thread::spawn(move || {
-        runtime.block_on(std::future::pending::<()>());
-    });
+    // The shared Tokio runtime lives for the whole process inside workers.rs
+    // (a `&'static Runtime` keeps its driver threads alive forever), so we only
+    // grab a handle for the UI; no keep-alive thread or per-call runtimes.
+    let handle = workers::runtime().handle().clone();
 
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()

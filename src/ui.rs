@@ -1,7 +1,6 @@
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Stroke, Vec2, Rounding};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::thread;
 
 use crate::innertube::{BrowseSection, InnerTubeClient, TrackItem};
 use crate::playback_manager::{PlaybackManager, PlaybackState};
@@ -32,11 +31,18 @@ pub struct MeduzaApp {
     // Home
     sections:         Arc<Mutex<Vec<BrowseSection>>>,
     is_loading_home:  Arc<Mutex<bool>>,
+    // Snapshot of the home feed rebuilt only when it changes — cloning the
+    // whole feed every frame was a major CPU overload source.
+    home_snapshot:    Vec<BrowseSection>,
+    home_dirty:       std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     // Search
     search_query:   String,
     last_search:    String,
     search_results: Arc<Mutex<Vec<TrackItem>>>,
+    // Snapshot of search results rebuilt only when a new search lands.
+    search_snapshot: Vec<TrackItem>,
+    search_dirty:    std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_searching:   Arc<Mutex<bool>>,
     suggestions:    Arc<Mutex<Vec<String>>>,
     show_suggest:   bool,
@@ -44,6 +50,10 @@ pub struct MeduzaApp {
     // Images
     img_cache:    HashMap<String, egui::TextureHandle>,
     img_pending:  Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
+    // Decoded RGBA pixels produced off the UI thread by the image workers:
+    // the UI thread only memcpys these into GPU textures (no decode on the
+    // frame path — big win on low-end CPUs).
+    image_rgba:   Arc<Mutex<HashMap<String, (usize, usize, Vec<u8>)>>>,
     logo_texture: Option<egui::TextureHandle>,
     // System Tray
     has_tray: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -52,12 +62,15 @@ pub struct MeduzaApp {
     show_now_playing: bool,
     disc_angle: f32,
 
-    // Dynamic background color state
+// Dynamic background color state
     bg_color_a:   [f32; 3],   // current interpolated primary color (RGB 0-1)
     bg_color_b:   [f32; 3],   // current interpolated secondary color
     bg_target_a:  [f32; 3],   // target primary color
     bg_target_b:  [f32; 3],   // target secondary color
-    bg_last_track: String,    // track id of last color extraction
+    bg_last_track: String,    // track id of last color submission
+    // Dominant-color results computed by the decode worker pool (never on the
+    // UI thread). UI just probes this map and lerps toward the result.
+    bg_color_store: Arc<Mutex<HashMap<String, ([f32; 3], [f32; 3])>>>,
 }
 
 impl MeduzaApp {
@@ -101,18 +114,48 @@ impl MeduzaApp {
         let innertube = Arc::new(InnerTubeClient::new());
         let playback  = Arc::new(PlaybackManager::new(Arc::clone(&innertube)));
 
+        // ── Visuals & Prominent Green Scrollbar Styling ──
+        // Set once at startup; cloning the whole Style/Visuals every frame was
+        // a significant per-frame CPU cost.
+        {
+            let mut vis = egui::Visuals::dark();
+            vis.panel_fill                     = BG;
+            vis.window_fill                    = BG;
+            vis.override_text_color            = Some(T_PRI);
+            vis.selection.bg_fill              = ACCENT;
+            vis.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 22, 26);
+            vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(40, 40, 48));
+            vis.widgets.inactive.bg_fill       = Color32::from_rgb(30, 180, 80);
+            vis.widgets.inactive.fg_stroke     = Stroke::new(1.5_f32, ACCENT);
+            vis.widgets.hovered.bg_fill        = ACCENT;
+            vis.widgets.hovered.fg_stroke      = Stroke::new(2.0_f32, Color32::from_rgb(50, 250, 130));
+            vis.widgets.active.bg_fill         = Color32::from_rgb(50, 240, 120);
+            vis.widgets.active.fg_stroke       = Stroke::new(2.0_f32, Color32::WHITE);
+            vis.extreme_bg_color               = Color32::from_rgb(10, 10, 12);
+            cc.egui_ctx.set_visuals(vis);
+
+            let mut style = (*cc.egui_ctx.style()).clone();
+            style.spacing.scroll.bar_width = 6.0;
+            style.spacing.scroll.handle_min_length = 48.0;
+            style.spacing.scroll.bar_inner_margin = 2.0;
+            style.spacing.scroll.bar_outer_margin = 2.0;
+            style.spacing.scroll.floating = false;
+            cc.egui_ctx.set_style(style);
+        }
+
         let sections = Arc::new(Mutex::new(Vec::<BrowseSection>::new()));
         let loading  = Arc::new(Mutex::new(true));
+        let home_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Load home feed cache instantly
-        let home_cache_path = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("meduza-music").join("home_cache.json");
+        let home_cache_path = crate::settings::app_cache_root().join("home_cache.json");
         
         if let Ok(data) = std::fs::read_to_string(&home_cache_path) {
             if let Ok(cached_feed) = serde_json::from_str::<Vec<BrowseSection>>(&data) {
                 if !cached_feed.is_empty() {
                     *sections.lock().unwrap() = cached_feed;
                     *loading.lock().unwrap() = false;
+                    home_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -122,6 +165,8 @@ impl MeduzaApp {
             let l = Arc::clone(&loading);
             let it = Arc::clone(&innertube);
             let engine = Arc::clone(&playback.recommendation_engine);
+            let dirty = Arc::clone(&home_dirty);
+            let feed_parallel = playback.settings.lock().unwrap_or_else(|e| e.into_inner()).home_feed_parallel();
             runtime.spawn(async move {
                 let mut feed = Vec::new();
                 
@@ -155,12 +200,13 @@ impl MeduzaApp {
                     }
                 }
                 
-                let std_feed = it.fetch_home_feed().await;
+                let std_feed = it.fetch_home_feed(feed_parallel).await;
                 feed.extend(std_feed);
 
                 if !feed.is_empty() {
-                    let _ = std::fs::write(&home_cache_path, serde_json::to_string(&feed).unwrap_or_default());
+                    let _ = crate::settings::write_private(&home_cache_path, &serde_json::to_string(&feed).unwrap_or_default());
                     *s.lock().unwrap() = feed;
+                    dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 *l.lock().unwrap() = false;
             });
@@ -228,14 +274,19 @@ impl MeduzaApp {
             innertube, playback, runtime,
             tab: Tab::Home,
             sections, is_loading_home: loading,
+            home_snapshot: Vec::new(),
+            home_dirty,
             search_query: String::new(),
             last_search:  String::new(),
             search_results: Arc::new(Mutex::new(Vec::new())),
+            search_snapshot: Vec::new(),
+            search_dirty:    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_searching:   Arc::new(Mutex::new(false)),
             suggestions:    Arc::new(Mutex::new(Vec::new())),
             show_suggest:   false,
-            img_cache:      HashMap::new(),
-            img_pending:    Arc::new(Mutex::new(HashMap::new())),
+            img_cache:       HashMap::new(),
+            img_pending:     Arc::new(Mutex::new(HashMap::new())),
+            image_rgba:      Arc::new(Mutex::new(HashMap::new())),
             logo_texture,
             has_tray,
             is_exiting:     false,
@@ -246,70 +297,192 @@ impl MeduzaApp {
             bg_target_a:  [0.05, 0.05, 0.08],
             bg_target_b:  [0.08, 0.03, 0.12],
             bg_last_track: String::new(),
+            bg_color_store: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     // ── Image loading ─────────────────────────────────────────────────────────
 
     fn image_cache_dir() -> std::path::PathBuf {
-        let d = dirs::cache_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-            .join("meduza-music").join("images");
-        std::fs::create_dir_all(&d).ok();
+        let d = crate::settings::app_cache_root().join("images");
+        crate::settings::ensure_private_dir(&d);
         d
     }
 
-    fn queue_image(id: &str, url: &str, pending: &Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>) {
+    fn queue_image(
+        id: &str,
+        url: &str,
+        pending: &Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
+        rgba: &Arc<Mutex<HashMap<String, (usize, usize, Vec<u8>)>>>,
+        max_dim: u32,
+    ) {
+        // SSRF defense: only fetch images from known YouTube/Google hosts.
+        if !crate::settings::host_is_allowed(url, crate::settings::UrlKind::Image) {
+            return;
+        }
         let mut p = pending.lock().unwrap();
         if p.contains_key(id) { return; }
         p.insert(id.to_string(), None);
-        let id2  = id.to_string();
-        let url2 = url.to_string();
-        let p2   = Arc::clone(pending);
-        thread::spawn(move || {
-            use std::io::Read;
-            use std::hash::{Hash, Hasher};
+        let id2    = id.to_string();
+        let url2   = url.to_string();
+        let p2     = Arc::clone(pending);
+        let rgba2  = Arc::clone(rgba);
+        crate::workers::decode().submit(move || {
             use std::collections::hash_map::DefaultHasher;
-            
+            use std::hash::{Hash, Hasher};
+            use std::io::Read;
+
             let mut hasher = DefaultHasher::new();
             id2.hash(&mut hasher);
             let cache_file = Self::image_cache_dir().join(format!("{}.img", hasher.finish()));
-            
-            if let Ok(buf) = std::fs::read(&cache_file) {
-                p2.lock().unwrap().insert(id2, Some(buf));
-                return;
-            }
 
-            if let Ok(resp) = ureq::get(&url2).call() {
+            let mut raw: Option<Vec<u8>> = None;
+
+            if let Ok(buf) = std::fs::read(&cache_file) {
+                // Only trust a cached file if it's a valid image within size limits.
+                if Self::image_is_safe(&buf) {
+                    raw = Some(buf);
+                }
+            } else if let Ok(resp) = crate::settings::fetch_allowed(
+                &url2,
+                crate::settings::UrlKind::Image,
+                crate::settings::FetchMethod::Get,
+                std::time::Duration::from_secs(15),
+            ) {
                 let mut buf = Vec::new();
                 let _ = resp.into_reader().take(5 * 1024 * 1024).read_to_end(&mut buf);
-                if !buf.is_empty() {
+                // Validate it decodes AND isn't a decompression bomb before
+                // persisting it to disk (avoids poisoned/oversized cache files).
+                if Self::image_is_safe(&buf) {
+                    crate::settings::ensure_private_dir(&cache_file);
                     let _ = std::fs::write(&cache_file, &buf);
-                    p2.lock().unwrap().insert(id2, Some(buf));
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600));
+                    raw = Some(buf);
                 }
             }
+
+            // Bound on-disk cache size: prune periodically so a long session of
+            // unique thumbnails never grows the images dir without bound.
+            static PRUNE_TICK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            if PRUNE_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+                Self::prune_image_cache();
+            }
+
+            // Decode to RGBA here (worker), so the UI thread only memcpys pixels
+            // into a GPU texture during the next frame.
+            if let Some(bytes) = raw {
+                let mut tex_px = (0usize, 0usize, Vec::<u8>::new());
+                if let Ok(img) = image::load_from_memory(&bytes) {
+                    let (w, h) = (img.width(), img.height());
+                    if w > 0 && h > 0 && w <= 4096 && h <= 4096 {
+                        if w.max(h) > max_dim {
+                            let scale = max_dim as f32 / w.max(h) as f32;
+                            let nw = ((w as f32 * scale) as u32).max(1);
+                            let nh = ((h as f32 * scale) as u32).max(1);
+                            let small = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+                            let rgba_px = small.into_raw();
+                            tex_px = (nw as usize, nh as usize, rgba_px);
+                        } else {
+                            let rgba_px = img.to_rgba8();
+                            tex_px = (w as usize, h as usize, rgba_px.into_raw());
+                        }
+                    }
+                }
+                {
+                    let mut r = rgba2.lock().unwrap();
+                    r.insert(id2.clone(), tex_px);
+                    if r.len() > 96 { r.clear(); } // bound decoded-RGBA memory
+                }
+                {
+                    let mut g = p2.lock().unwrap();
+                    g.insert(id2, Some(bytes));
+                    if g.len() > 96 { g.clear(); } // bound raw-bytes memory
+                }
+            } else {
+                // Mark as finished-but-empty so the UI never re-queues this id
+                // every frame (that was a repo-wide refresh storm on failures).
+                p2.lock().unwrap().insert(id2, Some(Vec::new()));
+            }
         });
+    }
+
+    /// LRU-style prune of the on-disk image cache: when there are more than
+    /// 300 cached thumbnails, remove the oldest by mtime until we're back at
+    /// the cap. Runs rarely (once per ~64 decodes) on the decode worker.
+    fn prune_image_cache() {
+        use std::time::{UNIX_EPOCH, SystemTime};
+        const MAX_FILES: usize = 300;
+        let Ok(entries) = std::fs::read_dir(Self::image_cache_dir()) else { return; };
+        let mut files: Vec<(std::path::PathBuf, SystemTime)> = entries
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                let mtime = e.metadata().and_then(|m| m.modified()).unwrap_or(UNIX_EPOCH);
+                Some((e.path(), mtime))
+            })
+            .collect();
+        if files.len() <= MAX_FILES {
+            return;
+        }
+        files.sort_by_key(|(_, t)| *t);
+        let overflow = files.len() - MAX_FILES;
+        for path in files.into_iter().take(overflow).map(|(p, _)| p) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// True if bytes decode as an image with sane dimensions (blocks decompression bombs).
+    fn image_is_safe(buf: &[u8]) -> bool {
+        use std::io::Cursor;
+
+        // Cheap header-only dimension probe BEFORE decoding any pixels. A small
+        // crafted file declaring huge dimensions never reaches the decoder.
+        let header_dims = (|| -> Option<(u32, u32)> {
+            let reader = image::io::Reader::new(Cursor::new(buf));
+            reader.with_guessed_format().ok()?.into_dimensions().ok()
+        })();
+        let Some((w, h)) = header_dims else { return false; };
+        if w == 0 || h == 0 || w > 4096 || h > 4096 {
+            return false;
+        }
+
+        match image::load_from_memory(buf) {
+            Ok(img) => {
+                let (w, h) = (img.width(), img.height());
+                w > 0 && h > 0 && w <= 4096 && h <= 4096
+            }
+            Err(_) => false,
+        }
     }
 
     fn get_texture<'a>(
         cache:   &'a mut HashMap<String, egui::TextureHandle>,
         pending: &Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
+        rgba:    &Arc<Mutex<HashMap<String, (usize, usize, Vec<u8>)>>>,
         ctx:     &egui::Context,
         id:      &str,
         url:     &str,
+        max_dim: u32,
     ) -> Option<&'a egui::TextureHandle> {
         if cache.contains_key(id) { return cache.get(id); }
-        let bytes = pending.lock().unwrap().get(id).and_then(|v| v.clone());
-        if let Some(data) = bytes {
-            if let Ok(img) = image::load_from_memory(&data) {
-                let rgba = img.to_rgba8();
-                let (w, h) = rgba.dimensions();
-                let ci = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+
+        // Designed: image workers wrote decoded RGBA; just upload it.
+        if let Some((w, h, px)) = rgba.lock().unwrap().get(id).cloned() {
+            if w > 0 && h > 0 {
+                let ci = egui::ColorImage::from_rgba_unmultiplied([w, h], &px);
                 let handle = ctx.load_texture(id, ci, egui::TextureOptions::LINEAR);
                 cache.insert(id.to_string(), handle);
+                rgba.lock().unwrap().remove(id);
                 return cache.get(id);
             }
-        } else {
-            Self::queue_image(id, url, pending);
+        }
+
+        // Not decoded yet — make sure a fetch/decode worker is queued.
+        {
+            let ready = pending.lock().unwrap().get(id).is_some();
+            if !ready {
+                Self::queue_image(id, url, pending, rgba, max_dim);
+            }
         }
         None
     }
@@ -474,12 +647,15 @@ impl MeduzaApp {
         self.last_search = q.clone();
         let results  = Arc::clone(&self.search_results);
         let searching = Arc::clone(&self.is_searching);
+        let dirty = Arc::clone(&self.search_dirty);
         let it = Arc::clone(&self.innertube);
         *searching.lock().unwrap() = true;
         *results.lock().unwrap()   = Vec::new();
+        dirty.store(true, std::sync::atomic::Ordering::SeqCst);
         self.runtime.spawn(async move {
             let res = it.search_tracks(&q).await;
             *results.lock().unwrap()   = res;
+            dirty.store(true, std::sync::atomic::Ordering::SeqCst);
             *searching.lock().unwrap() = false;
         });
     }
@@ -488,7 +664,13 @@ impl MeduzaApp {
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
         let loading  = *self.is_loading_home.lock().unwrap();
-        let sections = self.sections.lock().unwrap().clone();
+
+        // Rebuild the feed snapshot only when the underlying feed changed —
+        // avoids cloning the whole feed every frame.
+        if self.home_dirty.swap(false, std::sync::atomic::Ordering::SeqCst) || self.home_snapshot.is_empty() {
+            self.home_snapshot = self.sections.lock().unwrap().clone();
+        }
+        let sections = std::mem::take(&mut self.home_snapshot);
         let mut seen = std::collections::HashSet::<String>::new();
 
         let heavy_rot_raw = self.playback.recommendation_engine.lock().unwrap().get_heavy_rotation(8);
@@ -524,6 +706,8 @@ impl MeduzaApp {
                     let l  = Arc::clone(&self.is_loading_home);
                     let it = Arc::clone(&self.innertube);
                     let engine = Arc::clone(&self.playback.recommendation_engine);
+                    let dirty = Arc::clone(&self.home_dirty);
+                    let feed_parallel = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).home_feed_parallel();
                     self.runtime.spawn(async move {
                         let mut feed = Vec::new();
                         
@@ -557,10 +741,11 @@ impl MeduzaApp {
                             }
                         }
                         
-                        let std_feed = it.fetch_home_feed().await;
+                        let std_feed = it.fetch_home_feed(feed_parallel).await;
                         feed.extend(std_feed);
 
                         *s.lock().unwrap() = feed;
+                        dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         *l.lock().unwrap() = false;
                     });
                 }
@@ -593,6 +778,7 @@ impl MeduzaApp {
                     }
                 }
             });
+        self.home_snapshot = sections;
     }
 
     fn retry_btn(&self, ui: &mut egui::Ui) -> bool {
@@ -652,9 +838,10 @@ impl MeduzaApp {
 
         // Album art
         let pending = Arc::clone(&self.img_pending);
+        let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
         if let Some(tex) = Self::get_texture(
-            &mut self.img_cache, &pending, ui.ctx(),
-            &track.media_id, &track.thumbnail_url,
+            &mut self.img_cache, &pending, &self.image_rgba, ui.ctx(),
+            &track.media_id, &track.thumbnail_url, max_dim,
         ) {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             ui.painter().with_clip_rect(img_rect).image(tex.id(), img_rect, uv, Color32::WHITE);
@@ -787,7 +974,12 @@ impl MeduzaApp {
             return;
         }
 
-        let results = self.search_results.lock().unwrap().clone();
+        // Rebuild the results snapshot only when a new search lands — avoids
+        // cloning the full result list every frame while idle.
+        if self.search_dirty.swap(false, std::sync::atomic::Ordering::SeqCst) || self.search_snapshot.is_empty() {
+            self.search_snapshot = self.search_results.lock().unwrap().clone();
+        }
+        let results = std::mem::take(&mut self.search_snapshot);
         if results.is_empty() && !self.last_search.is_empty() {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -815,8 +1007,9 @@ impl MeduzaApp {
                     results.len(), self.last_search))
                     .color(T_DIM).font(FontId::proportional(12.0)));
                 ui.add_space(6.0);
-                self.track_list(ui, &results.clone());
+                self.track_list(ui, &results);
             });
+        self.search_snapshot = results;
     }
 
     fn genre_grid(&mut self, ui: &mut egui::Ui) {
@@ -883,8 +1076,9 @@ impl MeduzaApp {
             let tr = egui::Rect::from_center_size(
                 egui::pos2(rect.min.x + p + 34.0, rect.center().y), Vec2::splat(42.0));
             let pending = Arc::clone(&self.img_pending);
-            if let Some(tex) = Self::get_texture(&mut self.img_cache, &pending, ui.ctx(),
-                &track.media_id, &track.thumbnail_url)
+            let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
+            if let Some(tex) = Self::get_texture(&mut self.img_cache, &pending, &self.image_rgba, ui.ctx(),
+                &track.media_id, &track.thumbnail_url, max_dim)
             {
                 let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
                 ui.painter().with_clip_rect(tr).image(tex.id(), tr, uv, Color32::WHITE);
@@ -1011,7 +1205,8 @@ impl MeduzaApp {
 
                 let tex_opt = if let Some(ref t) = track {
                     let p = Arc::clone(&self.img_pending);
-                    Self::get_texture(&mut self.img_cache, &p, ui.ctx(), &t.media_id, &t.thumbnail_url)
+                    let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
+                    Self::get_texture(&mut self.img_cache, &p, &self.image_rgba, ui.ctx(), &t.media_id, &t.thumbnail_url, max_dim)
                 } else { None };
 
                 if let Some(texture) = tex_opt {
@@ -1467,16 +1662,36 @@ impl MeduzaApp {
                 // Must be drawn before any widgets so it doesn't paint over them
                 if let Some(ref t) = track {
                     if t.media_id != self.bg_last_track {
-                        let bytes_opt = self.img_pending.lock().unwrap()
-                            .get(&t.media_id).and_then(|v| v.clone());
-                        let (ta, tb) = if let Some(bytes) = bytes_opt {
-                            extract_dominant_colors(&bytes)
-                        } else {
-                            generate_track_colors(&t.title, &t.artist)
-                        };
+                        // Deterministic cheap target first…
+                        let (ta, tb) = generate_track_colors(&t.title, &t.artist);
                         self.bg_target_a = ta;
                         self.bg_target_b = tb;
                         self.bg_last_track = t.media_id.clone();
+
+                        // …then enrich with worker-extracted dominant colors so the
+                        // frame never blocks on image decode (esp. low-end CPUs).
+                        let heavy = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).heavy_background();
+                        if heavy {
+                            let store = Arc::clone(&self.bg_color_store);
+                            let id = t.media_id.clone();
+                            let bytes_opt = self.img_pending.lock().unwrap()
+                                .get(&t.media_id).and_then(|v| v.clone());
+                            let title = t.title.clone();
+                            let artist = t.artist.clone();
+                            crate::workers::decode().submit(move || {
+                                let (da, db) = if let Some(bytes) = bytes_opt {
+                                    extract_dominant_colors(&bytes)
+                                } else {
+                                    generate_track_colors(&title, &artist)
+                                };
+                                store.lock().unwrap_or_else(|e| e.into_inner()).insert(id, (da, db));
+                            });
+                        }
+                    }
+                    // Promote worker result if it has landed for this track.
+                    if let Some(&(a, b)) = self.bg_color_store.lock().unwrap_or_else(|e| e.into_inner()).get(&t.media_id) {
+                        self.bg_target_a = a;
+                        self.bg_target_b = b;
                     }
                 }
                 let is_low_end = self.playback.settings.lock().unwrap().low_end_mode;
@@ -1485,7 +1700,7 @@ impl MeduzaApp {
                     self.bg_color_a[i] += (self.bg_target_a[i] - self.bg_color_a[i]) * lerp_speed;
                     self.bg_color_b[i] += (self.bg_target_b[i] - self.bg_color_b[i]) * lerp_speed;
                 }
-                draw_ambient_blur_background(ui, rect, self.bg_color_a, self.bg_color_b);
+                draw_ambient_blur_background(ui, rect, self.bg_color_a, self.bg_color_b, !is_low_end);
 
                 // ── 2. Top Header (back button + label) ───────────────────────
                 let collapse_r = egui::Rect::from_min_size(
@@ -1512,7 +1727,8 @@ impl MeduzaApp {
 
                 let tex_opt = if let Some(ref t) = track {
                     let p = Arc::clone(&self.img_pending);
-                    Self::get_texture(&mut self.img_cache, &p, ui.ctx(), &t.media_id, &t.thumbnail_url)
+                    let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
+                    Self::get_texture(&mut self.img_cache, &p, &self.image_rgba, ui.ctx(), &t.media_id, &t.thumbnail_url, max_dim)
                 } else { None };
 
                 // ── 3. Vinyl Record Disk ───────────────────────────────────────
@@ -1818,11 +2034,14 @@ fn hsl_to_rgb_dark(h: f32, s: f32, l: f32) -> [f32; 3] {
 
 /// Paint a multi-layer soft ambient blur background for the Now Playing screen.
 /// Uses layered radial mesh gradients to create a blurred glow effect.
+/// When `glow` is false (low-end profile) we skip the 20-layer radial loop and
+/// draw a single flat tint instead — same look family, ~zero fill cost.
 fn draw_ambient_blur_background(
     ui: &mut egui::Ui,
     rect: egui::Rect,
     color_a: [f32; 3],
     color_b: [f32; 3],
+    glow: bool,
 ) {
     let painter = ui.painter();
 
@@ -1842,6 +2061,16 @@ fn draw_ambient_blur_background(
 
     let glow_center = egui::pos2(cx, cy - h * 0.12);
     let glow_radius = w.min(h) * 0.32; // tight radius — stays inside vinyl area
+
+    if !glow {
+        // One soft radial fill centered behind the vinyl — no radial loop.
+        painter.circle_filled(
+            glow_center,
+            glow_radius,
+            Color32::from_rgba_unmultiplied(r_ch, g_ch, b_ch, 28),
+        );
+        return;
+    }
 
     let layers = 20u32;
     for i in 0..layers {
@@ -2058,31 +2287,6 @@ fn draw_vinyl_record(
 
 impl eframe::App for MeduzaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Visuals & Prominent Green Scrollbar Styling (MUST BE AT TOP) ──
-        let mut vis = egui::Visuals::dark();
-        vis.panel_fill                     = BG;
-        vis.window_fill                    = BG;
-        vis.override_text_color            = Some(T_PRI);
-        vis.selection.bg_fill              = ACCENT;
-        vis.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 22, 26);
-        vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(40, 40, 48));
-        vis.widgets.inactive.bg_fill       = Color32::from_rgb(30, 180, 80);
-        vis.widgets.inactive.fg_stroke     = Stroke::new(1.5_f32, ACCENT);
-        vis.widgets.hovered.bg_fill        = ACCENT;
-        vis.widgets.hovered.fg_stroke      = Stroke::new(2.0_f32, Color32::from_rgb(50, 250, 130));
-        vis.widgets.active.bg_fill         = Color32::from_rgb(50, 240, 120);
-        vis.widgets.active.fg_stroke       = Stroke::new(2.0_f32, Color32::WHITE);
-        vis.extreme_bg_color               = Color32::from_rgb(10, 10, 12);
-        ctx.set_visuals(vis);
-
-        let mut style = (*ctx.style()).clone();
-        style.spacing.scroll.bar_width = 6.0;
-        style.spacing.scroll.handle_min_length = 48.0;
-        style.spacing.scroll.bar_inner_margin = 2.0;
-        style.spacing.scroll.bar_outer_margin = 2.0;
-        style.spacing.scroll.floating = false;
-        ctx.set_style(style);
-
         // Tray Event Handling
         if let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -2112,16 +2316,21 @@ impl eframe::App for MeduzaApp {
         // Handle auto advance
         self.playback.handle_auto_advance();
 
-        // Rotate vinyl record disc animation when playing (bypassed in Low-End Device Mode)
-        let is_low_end = self.playback.settings.lock().unwrap().low_end_mode;
+        // Repaint/cpu-load throttling:
+        // - 60fps (16ms) on the now-playing vinyl; 30fps (33ms) on low-end.
+        //   This was the main cause of the "music player lag" / CPU overload:
+        //   the app was forcing a full 60fps repaint of the whole UI (feed
+        //   panels, images, sidebar) at all times while playing.
+        // - ~10fps is plenty for the progress bar & navigation elsewhere.
         let st = self.playback.state.lock().unwrap().clone();
         if matches!(st, PlaybackState::Playing) {
-            if !is_low_end {
+            if self.show_now_playing {
+                let frame_ms = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).now_playing_frame_ms();
                 self.disc_angle += 0.015;
                 if self.disc_angle > std::f32::consts::TAU * 100.0 {
                     self.disc_angle = 0.0;
                 }
-                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                ctx.request_repaint_after(std::time::Duration::from_millis(frame_ms));
             } else {
                 ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
@@ -2134,9 +2343,11 @@ impl eframe::App for MeduzaApp {
             return;
         }
 
-        // Request repaint when new images arrive
-        if self.img_pending.lock().unwrap().values().any(|v| v.is_some()) {
-            ctx.request_repaint();
+        // Request repaint when a freshly decoded image is ready to upload. The
+        // get_texture() path drains the RGBA map as it uploads, so this idle
+        // burst stops once every visible thumbnail is on the GPU.
+        if self.image_rgba.lock().unwrap().values().any(|(w, _h, _)| *w > 0) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
 
         // ── Layout ───────────────────────────────────────────────────────────

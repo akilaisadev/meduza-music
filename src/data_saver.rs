@@ -1,18 +1,32 @@
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
+
+use crate::settings::{self, Semaphore};
 
 pub struct DataSaver {
     cache_dir: PathBuf,
 }
 
+// Bound concurrent background cache downloads so a large queue cannot spawn an
+// unbounded number of network connections / disk writes (CPU & bandwidth overload).
+static DL_SEM: Semaphore = Semaphore::new(2);
+
+/// Keep only alphanumeric chars in media IDs used for filenames — prevents
+/// path traversal / symlink tricks via a crafted video ID.
+fn sanitize_id(media_id: &str) -> String {
+    media_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(64)
+        .collect()
+}
+
 impl DataSaver {
     pub fn new() -> Self {
-        let base_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("meduza-music")
-            .join("audio");
-        let _ = fs::create_dir_all(&base_dir);
+        let base_dir = settings::app_cache_root().join("audio");
+        settings::ensure_private_dir(&base_dir);
         Self { cache_dir: base_dir }
     }
 
@@ -73,8 +87,10 @@ impl DataSaver {
 
     /// Check if track audio is cached locally. Returns local file path if present.
     pub fn get_cached_file(&self, media_id: &str) -> Option<String> {
+        let id = sanitize_id(media_id);
+        if id.is_empty() { return None; }
         for ext in &["webm", "m4a", "opus", "mp3"] {
-            let path = self.cache_dir.join(format!("{}.{}", media_id, ext));
+            let path = self.cache_dir.join(format!("{}.{}", id, ext));
             if path.exists() {
                 if let Ok(meta) = fs::metadata(&path) {
                     if meta.len() > 100_000 {
@@ -87,15 +103,28 @@ impl DataSaver {
     }
 
     /// Cache stream asynchronously in the background for 0-data replays.
-    pub fn cache_stream_in_bg(&self, media_id: String, stream_url: String, max_cache_mb: u64) {
+    ///
+    /// Downloads go through the shared `download` worker pool (bounded to a
+    /// couple of threads) instead of spawning a raw thread per track. When
+    /// `pace_downloads` is set (low-end mode) the read loop is staggered so a
+    /// big file write never starves the audio currently being streamed.
+    pub fn cache_stream_in_bg(&self, media_id: String, stream_url: String, max_cache_mb: u64, pace_downloads: bool) {
         if stream_url.starts_with('/') {
             return; // Already a local disk file
         }
+        // SSRF defense: only cache URLs from known Google/YouTube CDN hosts.
+        if !settings::host_is_allowed(&stream_url, settings::UrlKind::Stream) {
+            println!("[DataSaver] Refusing to cache non-whitelisted stream host.");
+            return;
+        }
+
         let dir = self.cache_dir.clone();
-        let self_dir = self.cache_dir.clone();
-        thread::spawn(move || {
+        crate::workers::download().submit(move || {
             // Give mpv 4 seconds of uninterrupted network priority to build audio buffer
             thread::sleep(std::time::Duration::from_secs(4));
+
+            let id = sanitize_id(&media_id);
+            if id.is_empty() { return; }
 
             let ext = if stream_url.contains("mime=audio%2Fwebm") || stream_url.contains(".webm") {
                 "webm"
@@ -104,35 +133,70 @@ impl DataSaver {
             } else {
                 "webm"
             };
-            let target_path = dir.join(format!("{}.{}", media_id, ext));
+            let target_path = dir.join(format!("{}.{}", id, ext));
             if target_path.exists() {
                 return;
             }
 
             // BUG-07: Validate URL is still live before downloading
-            // YouTube CDN URLs expire — check with a HEAD request first
-            let url_still_valid = ureq::head(&stream_url)
-                .timeout(std::time::Duration::from_secs(8))
-                .call()
-                .map(|r| r.status() == 200 || r.status() == 206)
-                .unwrap_or(false);
+            // YouTube CDN URLs expire — check with a HEAD request first.
+            // fetch_allowed re-validates the allowlist on every redirect hop.
+            let url_still_valid = settings::fetch_allowed(
+                &stream_url,
+                settings::UrlKind::Stream,
+                settings::FetchMethod::Head,
+                std::time::Duration::from_secs(8),
+            )
+            .map(|r| r.status() == 200 || r.status() == 206)
+            .unwrap_or(false);
 
             if !url_still_valid {
-                println!("[DataSaver] Stream URL for {} has expired, skipping cache.", media_id);
+                println!("[DataSaver] Stream URL for {} has expired, skipping cache.", id);
                 return;
             }
 
-            let temp_path = dir.join(format!("{}.tmp", media_id));
+            let temp_path = dir.join(format!("{}.tmp", id));
 
-            if let Ok(resp) = ureq::get(&stream_url).timeout(std::time::Duration::from_secs(180)).call() {
+            // Bound concurrent downloads: wait for a free slot.
+            let _guard = DL_SEM.acquire();
+
+            if let Ok(resp) = settings::fetch_allowed(
+                &stream_url,
+                settings::UrlKind::Stream,
+                settings::FetchMethod::Get,
+                std::time::Duration::from_secs(180),
+            ) {
                 if let Ok(mut file) = fs::File::create(&temp_path) {
+                    use std::io::Read;
                     let mut reader = resp.into_reader();
-                    if std::io::copy(&mut reader, &mut file).is_ok() {
+                    let mut buf = vec![0u8; 512 * 1024];
+                    let mut copied_ok = true;
+                    loop {
+                        match reader.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if file.write_all(&buf[..n]).is_err() {
+                                    copied_ok = false;
+                                    break;
+                                }
+                                // Pace: small sleep per chunk so a big download
+                                // yields the disk/network to the playing audio.
+                                if pace_downloads {
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                }
+                            }
+                            Err(_) => {
+                                copied_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if copied_ok {
                         let _ = fs::rename(&temp_path, &target_path);
-                        println!("[DataSaver] Cached {} (0-data on future replays!).", media_id);
+                        println!("[DataSaver] Cached {} (0-data on future replays!).", id);
 
                         // Enforce max cache size limit after new file save
-                        let ds = DataSaver { cache_dir: self_dir };
+                        let ds = DataSaver { cache_dir: dir };
                         ds.enforce_max_cache_size(max_cache_mb);
                     }
                 }
@@ -141,3 +205,4 @@ impl DataSaver {
         });
     }
 }
+

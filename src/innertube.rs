@@ -60,7 +60,7 @@ impl InnerTubeClient {
                 h
             })
             .build()
-            .unwrap();
+            .unwrap_or_else(|_| Client::new());
         Self { client }
     }
 
@@ -284,16 +284,28 @@ impl InnerTubeClient {
         sections
     }
 
-    /// Fetch home + explore + charts + moods + trending in parallel.
+    /// Fetch home + explore + charts + moods + trending in parallel (or fully
+    /// sequential when `parallel` is 1 — the low-end profile builds the same
+    /// feed with a single connection at a time).
     /// Enriches with rich Spotify-style playlist category shelves!
-    pub async fn fetch_home_feed(&self) -> Vec<BrowseSection> {
-        let (explore, home, trending, charts, moods) = tokio::join!(
-            self.fetch_browse("FEmusic_explore"),
-            self.fetch_browse("FEmusic_home"),
-            self.fetch_browse("FEmusic_trending"),
-            self.fetch_browse("FEmusic_charts"),
-            self.fetch_browse("FEmusic_moods_and_genres"),
-        );
+    pub async fn fetch_home_feed(&self, parallel: usize) -> Vec<BrowseSection> {
+        let do_parallel = parallel > 1;
+        let (explore, home, trending, charts, moods) = if do_parallel {
+            tokio::join!(
+                self.fetch_browse("FEmusic_explore"),
+                self.fetch_browse("FEmusic_home"),
+                self.fetch_browse("FEmusic_trending"),
+                self.fetch_browse("FEmusic_charts"),
+                self.fetch_browse("FEmusic_moods_and_genres"),
+            )
+        } else {
+            let home = self.fetch_browse("FEmusic_home").await;
+            let explore = self.fetch_browse("FEmusic_explore").await;
+            let charts = self.fetch_browse("FEmusic_charts").await;
+            let trending = self.fetch_browse("FEmusic_trending").await;
+            let moods = self.fetch_browse("FEmusic_moods_and_genres").await;
+            (explore, home, trending, charts, moods)
+        };
         let mut all = Vec::new();
         all.extend(home);
         all.extend(explore);
@@ -308,13 +320,22 @@ impl InnerTubeClient {
         all.retain(|s| !s.title.is_empty() && !s.items.is_empty());
 
         // Spotify-style category shelves enrichment
-        let (top, lofi, workout, viral, acoustic) = tokio::join!(
-            self.search_tracks("Top Global Hits"),
-            self.search_tracks("Chill Lofi Study Beats"),
-            self.search_tracks("Workout Dance Hype"),
-            self.search_tracks("Viral Hits TikTok Trending"),
-            self.search_tracks("Acoustic Indie Favorites"),
-        );
+        let (top, lofi, workout, viral, acoustic) = if do_parallel {
+            tokio::join!(
+                self.search_tracks("Top Global Hits"),
+                self.search_tracks("Chill Lofi Study Beats"),
+                self.search_tracks("Workout Dance Hype"),
+                self.search_tracks("Viral Hits TikTok Trending"),
+                self.search_tracks("Acoustic Indie Favorites"),
+            )
+        } else {
+            let top = self.search_tracks("Top Global Hits").await;
+            let lofi = self.search_tracks("Chill Lofi Study Beats").await;
+            let workout = self.search_tracks("Workout Dance Hype").await;
+            let viral = self.search_tracks("Viral Hits TikTok Trending").await;
+            let acoustic = self.search_tracks("Acoustic Indie Favorites").await;
+            (top, lofi, workout, viral, acoustic)
+        };
 
         if !top.is_empty() {
             all.push(BrowseSection { title: "🔥 Top Hits & Charting".to_string(), items: top });
