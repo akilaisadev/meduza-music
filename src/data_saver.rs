@@ -88,9 +88,15 @@ impl DataSaver {
 
     /// Cache stream asynchronously in the background for 0-data replays.
     pub fn cache_stream_in_bg(&self, media_id: String, stream_url: String, max_cache_mb: u64) {
+        if stream_url.starts_with('/') {
+            return; // Already a local disk file
+        }
         let dir = self.cache_dir.clone();
         let self_dir = self.cache_dir.clone();
         thread::spawn(move || {
+            // Give mpv 4 seconds of uninterrupted network priority to build audio buffer
+            thread::sleep(std::time::Duration::from_secs(4));
+
             let ext = if stream_url.contains("mime=audio%2Fwebm") || stream_url.contains(".webm") {
                 "webm"
             } else if stream_url.contains("mime=audio%2Fmp4") || stream_url.contains(".m4a") {
@@ -100,6 +106,19 @@ impl DataSaver {
             };
             let target_path = dir.join(format!("{}.{}", media_id, ext));
             if target_path.exists() {
+                return;
+            }
+
+            // BUG-07: Validate URL is still live before downloading
+            // YouTube CDN URLs expire — check with a HEAD request first
+            let url_still_valid = ureq::head(&stream_url)
+                .timeout(std::time::Duration::from_secs(8))
+                .call()
+                .map(|r| r.status() == 200 || r.status() == 206)
+                .unwrap_or(false);
+
+            if !url_still_valid {
+                println!("[DataSaver] Stream URL for {} has expired, skipping cache.", media_id);
                 return;
             }
 

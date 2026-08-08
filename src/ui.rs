@@ -17,8 +17,7 @@ const ACCENT:     Color32 = Color32::from_rgb(29, 185, 84);
 const T_PRI:      Color32 = Color32::from_rgb(255, 255, 255);
 const T_SEC:      Color32 = Color32::from_rgb(170, 170, 170);
 const T_DIM:      Color32 = Color32::from_rgb(90, 90, 90);
-const TRACK_BG:   Color32 = Color32::from_rgb(40, 40, 40);
-const PLAYER_BG:  Color32 = Color32::from_rgb(18, 18, 20);
+
 
 #[derive(Clone, PartialEq)]
 enum Tab { Home, Search, Library, Settings }
@@ -47,11 +46,18 @@ pub struct MeduzaApp {
     img_pending:  Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
     logo_texture: Option<egui::TextureHandle>,
     // System Tray
-    _tray_icon: Option<tray_icon::TrayIcon>,
+    has_tray: std::sync::Arc<std::sync::atomic::AtomicBool>,
     is_exiting: bool,
     
     show_now_playing: bool,
     disc_angle: f32,
+
+    // Dynamic background color state
+    bg_color_a:   [f32; 3],   // current interpolated primary color (RGB 0-1)
+    bg_color_b:   [f32; 3],   // current interpolated secondary color
+    bg_target_a:  [f32; 3],   // target primary color
+    bg_target_b:  [f32; 3],   // target secondary color
+    bg_last_track: String,    // track id of last color extraction
 }
 
 impl MeduzaApp {
@@ -171,42 +177,52 @@ impl MeduzaApp {
             None
         };
 
-        // System Tray Initialization
-        #[cfg(target_os = "linux")]
-        let _ = gtk::init();
+        // System Tray Initialization (Offloaded to fix startup transparency freeze)
+        let has_tray = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ht_clone = std::sync::Arc::clone(&has_tray);
+        std::thread::spawn(move || {
+            #[cfg(target_os = "linux")]
+            let _ = gtk::init();
 
-        let tray_icon = std::panic::catch_unwind(|| {
-            let tray_menu = tray_icon::menu::Menu::new();
-            let item_show = tray_icon::menu::MenuItem::with_id("show", "Show App", true, None);
-            let item_play = tray_icon::menu::MenuItem::with_id("play", "Play/Pause", true, None);
-            let item_quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
-            let _ = tray_menu.append_items(&[
-                &item_show,
-                &item_play,
-                &tray_icon::menu::PredefinedMenuItem::separator(),
-                &item_quit,
-            ]);
+            let tray_icon = std::panic::catch_unwind(|| {
+                let tray_menu = tray_icon::menu::Menu::new();
+                let item_show = tray_icon::menu::MenuItem::with_id("show", "Show App", true, None);
+                let item_play = tray_icon::menu::MenuItem::with_id("play", "Play/Pause", true, None);
+                let item_quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
+                let _ = tray_menu.append_items(&[
+                    &item_show,
+                    &item_play,
+                    &tray_icon::menu::PredefinedMenuItem::separator(),
+                    &item_quit,
+                ]);
 
-            let icon_data = include_bytes!("../assets/icon.png");
-            let tray_icon_img = if let Ok(img) = image::load_from_memory(icon_data) {
-                let rgba = img.into_rgba8();
-                let (w, h) = rgba.dimensions();
-                tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
-            } else {
-                None
-            };
+                let icon_data = include_bytes!("../assets/icon.png");
+                let tray_icon_img = if let Ok(img) = image::load_from_memory(icon_data) {
+                    let rgba = img.into_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    tray_icon::Icon::from_rgba(rgba.into_raw(), w, h).ok()
+                } else {
+                    None
+                };
 
-            if let Some(ic) = tray_icon_img {
-                tray_icon::TrayIconBuilder::new()
-                    .with_menu(Box::new(tray_menu))
-                    .with_tooltip("Meduza Music")
-                    .with_icon(ic)
-                    .build()
-                    .ok()
-            } else {
-                None
+                if let Some(ic) = tray_icon_img {
+                    tray_icon::TrayIconBuilder::new()
+                        .with_menu(Box::new(tray_menu))
+                        .with_tooltip("Meduza Music")
+                        .with_icon(ic)
+                        .build()
+                        .ok()
+                } else {
+                    None
+                }
+            }).unwrap_or(None);
+
+            if let Some(tray) = tray_icon {
+                ht_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::leak(Box::new(tray));
+                loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
             }
-        }).unwrap_or(None);
+        });
 
         Self {
             innertube, playback, runtime,
@@ -221,10 +237,15 @@ impl MeduzaApp {
             img_cache:      HashMap::new(),
             img_pending:    Arc::new(Mutex::new(HashMap::new())),
             logo_texture,
-            _tray_icon:     tray_icon,
+            has_tray,
             is_exiting:     false,
             show_now_playing: false,
             disc_angle: 0.0,
+            bg_color_a:   [0.05, 0.05, 0.08],
+            bg_color_b:   [0.08, 0.03, 0.12],
+            bg_target_a:  [0.05, 0.05, 0.08],
+            bg_target_b:  [0.08, 0.03, 0.12],
+            bg_last_track: String::new(),
         }
     }
 
@@ -480,6 +501,7 @@ impl MeduzaApp {
         let liked         = crate::recommendation_engine::RecommendationEngine::filter_unique(&liked_raw, &mut seen);
 
         if loading && sections.is_empty() && history.is_empty() && heavy_rot.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.add(egui::Spinner::new().size(44.0).color(ACCENT));
@@ -548,7 +570,7 @@ impl MeduzaApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .id_source("home")
             .show(ui, |ui| {
                 ui.add_space(8.0);
@@ -786,7 +808,7 @@ impl MeduzaApp {
 
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .id_source("search")
             .show(ui, |ui| {
                 ui.label(RichText::new(format!("{} results for \"{}\"",
@@ -911,7 +933,7 @@ impl MeduzaApp {
         } else {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .id_source("library")
                 .show(ui, |ui| {
                 ui.add_space(12.0);
@@ -928,7 +950,7 @@ impl MeduzaApp {
     fn bottom_player(&mut self, ui: &mut egui::Ui) {
         // Fill player background
         let full_rect = ui.max_rect();
-        ui.painter().rect_filled(full_rect, Rounding::ZERO, PLAYER_BG);
+        ui.painter().rect_filled(full_rect, Rounding::ZERO, Color32::from_rgb(18, 18, 20));
 
         // Read playback state
         let pos   = *self.playback.progress_secs.lock().unwrap();
@@ -940,8 +962,12 @@ impl MeduzaApp {
 
         // ── 1. Interactive Green Progress Bar at top edge of player ───────────
         let w = full_rect.width();
-        let bar_h = 5.0_f32;
-        let bar_rect = egui::Rect::from_min_size(full_rect.min, Vec2::new(w, bar_h));
+        let bar_h = 3.0_f32;
+        let bar_y_offset = 3.0_f32; // prevent handle clipping
+        let bar_rect = egui::Rect::from_min_size(
+            egui::pos2(full_rect.min.x, full_rect.min.y + bar_y_offset),
+            Vec2::new(w, bar_h)
+        );
         let bar_sense = ui.allocate_rect(bar_rect, Sense::click_and_drag());
         if bar_sense.clicked() || bar_sense.dragged() {
             if let Some(ptr) = bar_sense.interact_pointer_pos() {
@@ -950,7 +976,7 @@ impl MeduzaApp {
             }
         }
         
-        let bg_col = if bar_sense.hovered() { Color32::from_rgb(60, 60, 60) } else { TRACK_BG };
+        let bg_col = if bar_sense.hovered() { Color32::from_rgb(60, 60, 60) } else { Color32::from_rgb(30, 30, 30) };
         ui.painter().rect_filled(bar_rect, Rounding::ZERO, bg_col);
         
         if ratio > 0.0 {
@@ -964,8 +990,8 @@ impl MeduzaApp {
         }
 
         // ── 2. Three columns below bar ────────────────────────────────────────
-        let content_top = full_rect.min.y + bar_h;
-        let content_h   = full_rect.height() - bar_h;
+        let content_top = full_rect.min.y + bar_h + bar_y_offset;
+        let content_h   = full_rect.height() - (bar_h + bar_y_offset);
         let left_rect   = egui::Rect::from_min_size(
             egui::pos2(full_rect.min.x, content_top), Vec2::new(w * 0.30, content_h));
         let center_rect = egui::Rect::from_min_size(
@@ -1057,9 +1083,9 @@ impl MeduzaApp {
             });
         });
 
-        // ── Center: transport controls (vertically centered) ─────────────────
+        // ── Center: transport controls + Progress Seek Bar ─────────────────
         let cx = center_rect.center().x;
-        let cy = center_rect.center().y;
+        let cy = center_rect.center().y - 12.0;
 
         // Shuffle
         let is_shuf = *self.playback.is_shuffle.lock().unwrap();
@@ -1078,7 +1104,7 @@ impl MeduzaApp {
         }
 
         // Play/Pause
-        let play_r = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::splat(40.0));
+        let play_r = egui::Rect::from_center_size(egui::pos2(cx, cy), Vec2::splat(36.0));
         let (icon, hint) = match state {
             PlaybackState::Playing => ("⏸", "Pause"),
             PlaybackState::Paused  => ("▶",  "Play"),
@@ -1086,8 +1112,8 @@ impl MeduzaApp {
             _                      => ("▶",  "Play"),
         };
         let pp = egui::Button::new(
-            RichText::new(icon).color(Color32::BLACK).font(FontId::proportional(18.0)))
-            .fill(ACCENT).min_size(Vec2::splat(40.0)).rounding(Rounding::same(20.0));
+            RichText::new(icon).color(Color32::BLACK).font(FontId::proportional(17.0)))
+            .fill(ACCENT).min_size(Vec2::splat(36.0)).rounding(Rounding::same(18.0));
         if ui.put(play_r, pp).on_hover_text(hint).clicked() {
             self.playback.toggle_pause();
         }
@@ -1112,7 +1138,19 @@ impl MeduzaApp {
             self.playback.toggle_repeat();
         }
 
-        // ── Right: Volume + Time display aligned in right corner ──────────────
+        // ── Center Time Display ──
+        let time_curr_str = fmt_time(pos as u32);
+        let time_total_str = fmt_time(dur_raw as u32);
+        
+        ui.painter().text(
+            egui::pos2(cx + 130.0, cy),
+            egui::Align2::LEFT_CENTER,
+            format!("{} / {}", time_curr_str, time_total_str),
+            FontId::proportional(11.5),
+            T_DIM,
+        );
+
+        // ── Right: Volume control ─────────────────────────────────────────────
         ui.allocate_ui_at_rect(right_rect, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(16.0);
@@ -1175,18 +1213,13 @@ impl MeduzaApp {
                         self.playback.set_volume(80.0);
                     }
                 }
-
-                ui.add_space(16.0);
-
-                let time_str = format!("{} / {}", fmt_time(pos as u32), fmt_time(dur_raw as u32));
-                ui.label(RichText::new(time_str).color(T_SEC).font(FontId::proportional(12.0)));
             });
         });
     }
 
     fn show_settings(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .id_source("settings_scroll")
             .show(ui, |ui| {
                 ui.add_space(16.0);
@@ -1310,7 +1343,7 @@ impl MeduzaApp {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Meduza Music Player").color(T_PRI).font(FontId::proportional(18.0)).strong());
                                     ui.add_space(8.0);
-                                    ui.label(RichText::new("v0.2.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
+                                    ui.label(RichText::new("v1.0.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
                                 });
 
                                 ui.add_space(4.0);
@@ -1430,7 +1463,31 @@ impl MeduzaApp {
                 let cx   = rect.center().x;
                 let cy   = rect.center().y;
 
-                // ── 1. Top Header ─────────────────────────────────────────────
+                // ── 1. Compute background colors (lerp) and draw background FIRST ──
+                // Must be drawn before any widgets so it doesn't paint over them
+                if let Some(ref t) = track {
+                    if t.media_id != self.bg_last_track {
+                        let bytes_opt = self.img_pending.lock().unwrap()
+                            .get(&t.media_id).and_then(|v| v.clone());
+                        let (ta, tb) = if let Some(bytes) = bytes_opt {
+                            extract_dominant_colors(&bytes)
+                        } else {
+                            generate_track_colors(&t.title, &t.artist)
+                        };
+                        self.bg_target_a = ta;
+                        self.bg_target_b = tb;
+                        self.bg_last_track = t.media_id.clone();
+                    }
+                }
+                let is_low_end = self.playback.settings.lock().unwrap().low_end_mode;
+                let lerp_speed = if is_low_end { 1.0_f32 } else { 0.04_f32 };
+                for i in 0..3 {
+                    self.bg_color_a[i] += (self.bg_target_a[i] - self.bg_color_a[i]) * lerp_speed;
+                    self.bg_color_b[i] += (self.bg_target_b[i] - self.bg_color_b[i]) * lerp_speed;
+                }
+                draw_ambient_blur_background(ui, rect, self.bg_color_a, self.bg_color_b);
+
+                // ── 2. Top Header (back button + label) ───────────────────────
                 let collapse_r = egui::Rect::from_min_size(
                     egui::pos2(rect.min.x + 20.0, rect.min.y + 16.0),
                     Vec2::splat(36.0),
@@ -1458,9 +1515,10 @@ impl MeduzaApp {
                     Self::get_texture(&mut self.img_cache, &p, ui.ctx(), &t.media_id, &t.thumbnail_url)
                 } else { None };
 
+                // ── 3. Vinyl Record Disk ───────────────────────────────────────
                 draw_vinyl_record(ui, vinyl_center, radius, tex_opt, self.disc_angle);
 
-                // ── 3. Title & Artist (Centered) ──────────────────────────────
+                // ── 4. Title & Artist (Centered) ──────────────────────────────
                 if let Some(ref t) = track {
                     ui.painter().text(
                         egui::pos2(cx, cy + 60.0),
@@ -1680,6 +1738,127 @@ impl MeduzaApp {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Extract two dominant colors from raw image bytes (JPEG/PNG/WebP).
+/// Returns (primary, secondary) as [f32;3] RGB normalized 0-1.
+/// Uses a fast 8×8 downsampled grid to find vibrant colors.
+fn extract_dominant_colors(bytes: &[u8]) -> ([f32; 3], [f32; 3]) {
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(_) => return default_bg_colors(),
+    };
+
+    let small = img.thumbnail(32, 32).to_rgba8();
+    let pixels: Vec<(f32, f32, f32)> = small
+        .chunks_exact(4)
+        .filter(|p| p[3] > 128)
+        .map(|p| (p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0))
+        .collect();
+
+    if pixels.is_empty() {
+        return default_bg_colors();
+    }
+
+    // Sort by "vibrancy" (saturation proxy = max-min channel diff)
+    let mut vibrant: Vec<(f32, f32, f32, f32)> = pixels.iter()
+        .map(|&(r, g, b)| {
+            let mx = r.max(g).max(b);
+            let mn = r.min(g).min(b);
+            (r, g, b, mx - mn) // (r, g, b, vibrancy)
+        })
+        .collect();
+    vibrant.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Primary: top vibrant pixel, dimmed to stay dark
+    let (r1, g1, b1, _) = vibrant[0];
+    let primary = [r1 * 0.35, g1 * 0.35, b1 * 0.35];
+
+    // Secondary: pick from bottom-quarter of sorted list for contrast
+    let sec_idx = (vibrant.len() * 3 / 4).max(1).min(vibrant.len() - 1);
+    let (r2, g2, b2, _) = vibrant[sec_idx];
+    let secondary = [r2 * 0.25, g2 * 0.25, b2 * 0.25];
+
+    (primary, secondary)
+}
+
+/// Generate deterministic ambient colors from track metadata when image is unavailable.
+fn generate_track_colors(title: &str, artist: &str) -> ([f32; 3], [f32; 3]) {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h1 = DefaultHasher::new();
+    title.hash(&mut h1);
+    let hue1 = (h1.finish() % 360) as f32;
+
+    let mut h2 = DefaultHasher::new();
+    artist.hash(&mut h2);
+    let hue2 = (h2.finish() % 360) as f32;
+
+    (hsl_to_rgb_dark(hue1, 0.7, 0.18), hsl_to_rgb_dark(hue2, 0.6, 0.14))
+}
+
+fn default_bg_colors() -> ([f32; 3], [f32; 3]) {
+    ([0.05, 0.04, 0.10], [0.10, 0.03, 0.08])
+}
+
+/// Convert HSL to dark-mode RGB (0-1).
+fn hsl_to_rgb_dark(h: f32, s: f32, l: f32) -> [f32; 3] {
+    let h = h / 360.0;
+    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let p = 2.0 * l - q;
+    let hue2rgb = |p: f32, q: f32, mut t: f32| -> f32 {
+        if t < 0.0 { t += 1.0; }
+        if t > 1.0 { t -= 1.0; }
+        if t < 1.0 / 6.0 { return p + (q - p) * 6.0 * t; }
+        if t < 1.0 / 2.0 { return q; }
+        if t < 2.0 / 3.0 { return p + (q - p) * (2.0 / 3.0 - t) * 6.0; }
+        p
+    };
+    [hue2rgb(p, q, h + 1.0 / 3.0), hue2rgb(p, q, h), hue2rgb(p, q, h - 1.0 / 3.0)]
+}
+
+/// Paint a multi-layer soft ambient blur background for the Now Playing screen.
+/// Uses layered radial mesh gradients to create a blurred glow effect.
+fn draw_ambient_blur_background(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    color_a: [f32; 3],
+    color_b: [f32; 3],
+) {
+    let painter = ui.painter();
+
+    // Clean near-black base
+    painter.rect_filled(rect, Rounding::ZERO, Color32::from_rgb(10, 10, 12));
+
+    let cx = rect.center().x;
+    let cy = rect.center().y;
+    let w  = rect.width();
+    let h  = rect.height();
+
+    // Single very subtle glow strictly behind the vinyl disc (upper half only)
+    // Blend colors for a unified, harmonious tint
+    let r_ch = ((color_a[0] + color_b[0]) * 0.5 * 255.0) as u8;
+    let g_ch = ((color_a[1] + color_b[1]) * 0.5 * 255.0) as u8;
+    let b_ch = ((color_a[2] + color_b[2]) * 0.5 * 255.0) as u8;
+
+    let glow_center = egui::pos2(cx, cy - h * 0.12);
+    let glow_radius = w.min(h) * 0.32; // tight radius — stays inside vinyl area
+
+    let layers = 20u32;
+    for i in 0..layers {
+        let t    = i as f32 / layers as f32;
+        let r    = glow_radius * t;
+        let fade = 1.0 - t;
+        // max alpha 28 — just a whisper of color, not visible as a shape
+        let a = (28.0_f32 * fade * fade) as u8;
+        painter.circle_filled(
+            glow_center,
+            r,
+            Color32::from_rgba_unmultiplied(r_ch, g_ch, b_ch, a),
+        );
+    }
+}
+
+
 fn load_system_fallback_fonts(fonts: &mut egui::FontDefinitions) {
     let font_dirs = [
         "/usr/share/fonts/truetype/noto",
@@ -1752,37 +1931,75 @@ fn draw_vinyl_record(
     tex: Option<&egui::TextureHandle>,
     angle: f32,
 ) {
-    // 1. Black Outer Vinyl Disc Body
-    // Make the base brighter so it contrasts with the very dark background
-    ui.painter().circle_filled(center, radius, Color32::from_rgb(22, 22, 24));
+    let center_hole_r = radius * 0.18; // Sleek central black hub radius (~30px)
+
+    // 1. Base Vinyl Outer Body & Outline
+    ui.painter().circle_filled(center, radius, Color32::from_rgb(18, 18, 20));
     ui.painter().circle_stroke(center, radius, Stroke::new(1.5_f32, Color32::from_rgb(45, 45, 50)));
 
-    // 2. Realistic Outer Vinyl Record Grooves
-    let label_r = radius * 0.33; 
-    let groove_min = label_r + 4.0;
+    // 2. Full-Cover Rotating Album Artwork Texture (Spans full disk radius)
+    if let Some(texture) = tex {
+        let mut mesh = egui::Mesh::with_texture(texture.id());
+        
+        // Center vertex
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: center,
+            uv: egui::pos2(0.5, 0.5),
+            color: Color32::from_rgb(235, 235, 235),
+        });
+
+        // 64 segment circular fan perimeter spanning full disk radius
+        let segments = 64;
+        let art_radius = radius - 1.5;
+        for i in 0..segments {
+            let frac = (i as f32) / (segments as f32);
+            let theta = frac * 2.0 * std::f32::consts::PI;
+            let rot_theta = theta + angle;
+            
+            let pos = center + egui::vec2(rot_theta.cos(), rot_theta.sin()) * art_radius;
+            let uv_x = 0.5 + 0.5 * theta.cos();
+            let uv_y = 0.5 + 0.5 * theta.sin();
+
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos,
+                uv: egui::pos2(uv_x, uv_y),
+                color: Color32::from_rgb(235, 235, 235),
+            });
+        }
+
+        // Add fan triangles
+        for i in 1..=segments {
+            let next = if i == segments { 1 } else { (i + 1) as u32 };
+            mesh.add_triangle(0, i as u32, next);
+        }
+
+        ui.painter().add(mesh);
+    } else {
+        // Fallback default vinyl record body gradient
+        ui.painter().circle_filled(center, radius - 2.0, Color32::from_rgb(28, 28, 32));
+    }
+
+    // 3. Realistic Concentric Vinyl Record Grooves overlayed on full disk
+    let groove_min = center_hole_r + 4.0;
     let groove_max = radius - 4.0;
-    
-    // Draw many subtle concentric circles to simulate grooves
-    let num_grooves = (radius * 0.3) as usize; 
+    let num_grooves = (radius * 0.35) as usize; 
     let step = (groove_max - groove_min) / (num_grooves as f32).max(1.0);
     
     for i in 0..num_grooves {
         let r = groove_min + (i as f32) * step;
-        // Make grooves brighter so they are visible
-        let brightness = if i % 7 == 0 { 42 } else if i % 3 == 0 { 32 } else { 26 };
+        let alpha = if i % 7 == 0 { 42 } else if i % 3 == 0 { 28 } else { 18 };
         ui.painter().circle_stroke(
             center,
             r,
-            Stroke::new(0.8_f32, Color32::from_rgb(brightness, brightness, brightness)),
+            Stroke::new(0.8_f32, Color32::from_rgba_unmultiplied(10, 10, 15, alpha)),
         );
     }
 
-    // 3. Light Sheen Reflections (Hourglass shape)
-    let sheen_color = Color32::from_rgba_unmultiplied(255, 255, 255, 12);
-    // Draw two opposite wedges
+    // 4. Light Sheen Reflections (Hourglass shape)
+    let sheen_color = Color32::from_rgba_unmultiplied(255, 255, 255, 14);
     for &base_angle in &[-std::f32::consts::FRAC_PI_4, std::f32::consts::PI - std::f32::consts::FRAC_PI_4] {
         let mut mesh = egui::Mesh::default();
-        let spread = 0.3_f32; // slightly wider sheen
+        let spread = 0.35_f32;
         
         mesh.vertices.push(egui::epaint::Vertex {
             pos: center,
@@ -1794,10 +2011,8 @@ fn draw_vinyl_record(
         for i in 0..=segments {
             let frac = (i as f32) / (segments as f32);
             let theta = base_angle - spread + (spread * 2.0 * frac);
-            
             let pos = center + egui::vec2(theta.cos(), theta.sin()) * radius;
-            // The edge of the reflection fades out
-            let alpha = (1.0 - (frac - 0.5).abs() * 2.0) * 16.0; 
+            let alpha = (1.0 - (frac - 0.5).abs() * 2.0) * 18.0; 
             let edge_color = Color32::from_rgba_unmultiplied(255, 255, 255, alpha as u8);
             
             mesh.vertices.push(egui::epaint::Vertex {
@@ -1813,79 +2028,61 @@ fn draw_vinyl_record(
         ui.painter().add(mesh);
     }
 
-    // Rotating specular highlight lines to give extra dimension when spinning
+    // 5. Rotating Specular Highlight Lines
     for &a in &[angle, angle + std::f32::consts::PI] {
-        let p1 = center + egui::vec2(a.cos(), a.sin()) * (label_r + 2.0);
+        let p1 = center + egui::vec2(a.cos(), a.sin()) * (center_hole_r + 2.0);
         let p2 = center + egui::vec2(a.cos(), a.sin()) * (radius - 2.0);
         ui.painter().line_segment(
             [p1, p2],
-            Stroke::new(2.0_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 12)),
+            Stroke::new(1.8_f32, Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
         );
     }
 
-    // 4. CIRCULAR ALBUM ARTWORK VINYL RECORD LABEL
-    if let Some(texture) = tex {
-        let mut mesh = egui::Mesh::with_texture(texture.id());
-        
-        // Center vertex
-        mesh.vertices.push(egui::epaint::Vertex {
-            pos: center,
-            uv: egui::pos2(0.5, 0.5),
-            color: Color32::WHITE,
-        });
-
-        // 64 segment circular fan perimeter
-        let segments = 64;
-        for i in 0..segments {
-            let frac = (i as f32) / (segments as f32);
-            let theta = frac * 2.0 * std::f32::consts::PI;
-            let rot_theta = theta + angle;
-            
-            let pos = center + egui::vec2(rot_theta.cos(), rot_theta.sin()) * label_r;
-            let uv_x = 0.5 + 0.5 * theta.cos();
-            let uv_y = 0.5 + 0.5 * theta.sin();
-
-            mesh.vertices.push(egui::epaint::Vertex {
-                pos,
-                uv: egui::pos2(uv_x, uv_y),
-                color: Color32::WHITE,
-            });
-        }
-
-        // Add fan triangles
-        for i in 1..=segments {
-            let next = if i == segments { 1 } else { (i + 1) as u32 };
-            mesh.add_triangle(0, i as u32, next);
-        }
-
-        ui.painter().add(mesh);
-        ui.painter().circle_stroke(
-            center,
-            label_r,
-            Stroke::new(2.0_f32, Color32::from_rgb(35, 35, 40)),
-        );
-    } else {
-        // Fallback realistic label look
-        ui.painter().circle_filled(center, label_r, Color32::from_rgb(180, 40, 40));
-        ui.painter().circle_stroke(
-            center,
-            label_r,
-            Stroke::new(2.0_f32, Color32::from_rgb(120, 20, 20)),
-        );
-        ui.painter().text(
-            center,
-            egui::Align2::CENTER_CENTER,
-            "♪",
-            FontId::proportional(label_r * 0.5),
-            Color32::from_rgb(240, 220, 220),
-        );
-    }
+    // 6. Sleek Center Black Hub & Metallic Spindle Hole
+    ui.painter().circle_filled(center, center_hole_r, Color32::from_rgb(10, 10, 12));
+    ui.painter().circle_stroke(
+        center,
+        center_hole_r,
+        Stroke::new(2.0_f32, Color32::from_rgb(35, 35, 40)),
+    );
+    let spindle_r = 5.5_f32;
+    ui.painter().circle_filled(center, spindle_r, Color32::from_rgb(4, 4, 6));
+    ui.painter().circle_stroke(
+        center,
+        spindle_r,
+        Stroke::new(1.2_f32, Color32::from_rgb(75, 75, 80)),
+    );
 }
 
 // ── eframe::App ───────────────────────────────────────────────────────────────
 
 impl eframe::App for MeduzaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // ── Visuals & Prominent Green Scrollbar Styling (MUST BE AT TOP) ──
+        let mut vis = egui::Visuals::dark();
+        vis.panel_fill                     = BG;
+        vis.window_fill                    = BG;
+        vis.override_text_color            = Some(T_PRI);
+        vis.selection.bg_fill              = ACCENT;
+        vis.widgets.noninteractive.bg_fill = Color32::from_rgb(22, 22, 26);
+        vis.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, Color32::from_rgb(40, 40, 48));
+        vis.widgets.inactive.bg_fill       = Color32::from_rgb(30, 180, 80);
+        vis.widgets.inactive.fg_stroke     = Stroke::new(1.5_f32, ACCENT);
+        vis.widgets.hovered.bg_fill        = ACCENT;
+        vis.widgets.hovered.fg_stroke      = Stroke::new(2.0_f32, Color32::from_rgb(50, 250, 130));
+        vis.widgets.active.bg_fill         = Color32::from_rgb(50, 240, 120);
+        vis.widgets.active.fg_stroke       = Stroke::new(2.0_f32, Color32::WHITE);
+        vis.extreme_bg_color               = Color32::from_rgb(10, 10, 12);
+        ctx.set_visuals(vis);
+
+        let mut style = (*ctx.style()).clone();
+        style.spacing.scroll.bar_width = 6.0;
+        style.spacing.scroll.handle_min_length = 48.0;
+        style.spacing.scroll.bar_inner_margin = 2.0;
+        style.spacing.scroll.bar_outer_margin = 2.0;
+        style.spacing.scroll.floating = false;
+        ctx.set_style(style);
+
         // Tray Event Handling
         if let Ok(_event) = tray_icon::TrayIconEvent::receiver().try_recv() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1907,7 +2104,7 @@ impl eframe::App for MeduzaApp {
         }
 
         // Intercept window close (X button) to hide to tray instead (only if system tray icon exists)
-        if self._tray_icon.is_some() && ctx.input(|i| i.viewport().close_requested()) && !self.is_exiting {
+        if self.has_tray.load(std::sync::atomic::Ordering::SeqCst) && ctx.input(|i| i.viewport().close_requested()) && !self.is_exiting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
@@ -1926,10 +2123,10 @@ impl eframe::App for MeduzaApp {
                 }
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
             }
-        } else if matches!(st, PlaybackState::Loading) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        } else if matches!(st, PlaybackState::Loading) || *self.is_loading_home.lock().unwrap() || *self.is_searching.lock().unwrap() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         if self.show_now_playing {
@@ -1941,27 +2138,6 @@ impl eframe::App for MeduzaApp {
         if self.img_pending.lock().unwrap().values().any(|v| v.is_some()) {
             ctx.request_repaint();
         }
-
-        // ── Visuals & Scrollbar Styling ──────────────────────────────────────
-        let mut vis = egui::Visuals::dark();
-        vis.panel_fill                     = BG;
-        vis.window_fill                    = BG;
-        vis.override_text_color            = Some(T_PRI);
-        vis.selection.bg_fill              = ACCENT;
-        vis.widgets.noninteractive.bg_fill = BG_CARD;
-        vis.widgets.inactive.bg_fill       = Color32::from_rgb(50, 50, 62);
-        vis.widgets.hovered.bg_fill        = Color32::from_rgb(80, 80, 105);
-        vis.widgets.active.bg_fill         = ACCENT;
-        vis.extreme_bg_color               = Color32::from_rgb(6, 6, 6);
-        vis.widgets.inactive.fg_stroke     = Stroke::NONE;
-        ctx.set_visuals(vis);
-
-        let mut style = (*ctx.style()).clone();
-        style.spacing.scroll.bar_width = 10.0;
-        style.spacing.scroll.handle_min_length = 36.0;
-        style.spacing.scroll.bar_inner_margin = 3.0;
-        style.spacing.scroll.bar_outer_margin = 3.0;
-        ctx.set_style(style);
 
         // ── Layout ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("player")
@@ -1984,7 +2160,7 @@ impl eframe::App for MeduzaApp {
             .frame(
                 egui::Frame::none()
                     .fill(BG)
-                    .inner_margin(egui::Margin::symmetric(20.0, 12.0))
+                    .inner_margin(egui::Margin { left: 20.0, right: 6.0, top: 12.0, bottom: 12.0 })
             )
             .show(ctx, |ui| {
                 match self.tab {

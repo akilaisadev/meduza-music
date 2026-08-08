@@ -29,6 +29,7 @@ fn main() -> eframe::Result<()> {
             .with_title("Meduza Music")
             .with_inner_size([1200.0, 760.0])
             .with_min_inner_size([900.0, 600.0])
+            .with_visible(false)
             .with_app_id("org.meduzamusic.MeduzaMusic")
             .with_icon(
                 eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
