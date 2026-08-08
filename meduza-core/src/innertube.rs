@@ -114,7 +114,11 @@ impl InnerTubeClient {
                     if let Some(url) = last["url"].as_str() {
                         // Strip size params to get high-quality square thumbnail
                         let clean = url.split('=').next().unwrap_or(url);
-                        return format!("{}=w400-h400-l90-rj", clean);
+                        let mut url_fixed = clean.to_string();
+                        if url_fixed.starts_with("//") {
+                            url_fixed = format!("https:{}", url_fixed);
+                        }
+                        return format!("{}=w400-h400-l90-rj", url_fixed);
                     }
                 }
             }
@@ -191,6 +195,36 @@ impl InnerTubeClient {
         Some(TrackItem { title, artist, media_id: vid, thumbnail_url, duration_seconds })
     }
 
+    /// Parse a musicNavigationButtonRenderer (genre / mood / browse tiles).
+    /// These now make up the whole "Moods & Genres" page and the explore
+    /// category carousel. They carry a browseEndpoint instead of a video id,
+    /// so we encode it as `BROWSE:<browseId>|<params>` and let the playback
+    /// layer expand it into real tracks when clicked.
+    fn parse_navigation_button(btn: &serde_json::Value) -> Option<TrackItem> {
+        let cmd = btn.get("clickCommand")?;
+        let nav = cmd.get("browseEndpoint").or_else(|| {
+            cmd.get("navigationEndpoint").and_then(|n| n.get("browseEndpoint"))
+        })?;
+        let browse_id = nav.get("browseId").and_then(|b| b.as_str())?;
+        if browse_id.is_empty() { return None; }
+
+        let title = btn.get("buttonText")
+            .and_then(|t| t["runs"][0]["text"].as_str())
+            .or_else(|| btn.get("text").and_then(|t| t["runs"][0]["text"].as_str()))
+            .unwrap_or("Explore")
+            .to_string();
+        if title.is_empty() { return None; }
+
+        let params = nav.get("params").and_then(|p| p.as_str()).unwrap_or("").to_string();
+        Some(TrackItem {
+            title,
+            artist: "Explore".to_string(),
+            media_id: format!("BROWSE:{}|{}", browse_id, params),
+            thumbnail_url: String::new(),
+            duration_seconds: 0,
+        })
+    }
+
     /// Parse a musicTwoRowItemRenderer (used in carousel/grid)
     fn parse_two_row(r: &serde_json::Value) -> Option<TrackItem> {
         let mut vid = Self::video_id(r).unwrap_or_default();
@@ -231,6 +265,8 @@ impl InnerTubeClient {
                     Self::parse_two_row(r)
                 } else if let Some(r) = item.get("musicResponsiveListItemRenderer") {
                     Self::parse_responsive(r)
+                } else if let Some(r) = item.get("musicNavigationButtonRenderer") {
+                    Self::parse_navigation_button(r)
                 } else {
                     None
                 };
@@ -248,47 +284,112 @@ impl InnerTubeClient {
             ["tabs"][0]["tabRenderer"]["content"]["sectionListRenderer"]["contents"]
             .as_array();
 
-        let Some(list) = section_list else { return sections; };
+        if let Some(list) = section_list {
+            for sec in list {
+                // unwrap itemSectionRenderer wrapper
+                let inner = sec.get("itemSectionRenderer")
+                    .map(|isr| &isr["contents"][0])
+                    .unwrap_or(sec);
 
-        for sec in list {
-            // unwrap itemSectionRenderer wrapper
-            let inner = sec.get("itemSectionRenderer")
-                .map(|isr| &isr["contents"][0])
-                .unwrap_or(sec);
-
-            if let Some(carousel) = inner.get("musicCarouselShelfRenderer") {
-                let title = carousel["header"]["musicCarouselShelfBasicHeaderRenderer"]
-                    ["title"]["runs"][0]["text"].as_str()
-                    .unwrap_or("Featured").to_string();
-                let items = Self::parse_shelf_contents(&carousel["contents"]);
-                if !items.is_empty() {
-                    sections.push(BrowseSection { title, items });
-                }
-            } else if let Some(shelf) = inner.get("musicShelfRenderer") {
-                let title = Self::text_run(&shelf["title"]["runs"]);
-                let title = if title.is_empty() { "Tracks".to_string() } else { title };
-                let items = Self::parse_shelf_contents(&shelf["contents"]);
-                if !items.is_empty() {
-                    sections.push(BrowseSection { title, items });
-                }
-            } else if let Some(grid) = inner.get("gridRenderer") {
-                let items = Self::parse_shelf_contents(&grid["items"]);
-                if !items.is_empty() {
-                    sections.push(BrowseSection { title: "New Releases".to_string(), items });
+                if let Some(carousel) = inner.get("musicCarouselShelfRenderer") {
+                    let title = carousel["header"]["musicCarouselShelfBasicHeaderRenderer"]
+                        ["title"]["runs"][0]["text"].as_str()
+                        .unwrap_or("Featured").to_string();
+                    let items = Self::parse_shelf_contents(&carousel["contents"]);
+                    if !items.is_empty() {
+                        sections.push(BrowseSection { title, items });
+                    }
+                } else if let Some(shelf) = inner.get("musicShelfRenderer") {
+                    let title = Self::text_run(&shelf["title"]["runs"]);
+                    let title = if title.is_empty() { "Tracks".to_string() } else { title };
+                    let items = Self::parse_shelf_contents(&shelf["contents"]);
+                    if !items.is_empty() {
+                        sections.push(BrowseSection { title, items });
+                    }
+                } else if let Some(grid) = inner.get("gridRenderer") {
+                    let items = Self::parse_shelf_contents(&grid["items"]);
+                    if !items.is_empty() {
+                        sections.push(BrowseSection { title: "New Releases".to_string(), items });
+                    }
                 }
             }
         }
 
+        // YouTube has repeatedly re-wrapped browse responses; YouTube ever
+        // returns a structure that no longer matches the fixed path above we
+        // deep-scan the whole JSON tree for shelf/carousel/grid renderers so the
+        // feed never silently comes back empty.
+        if sections.is_empty() {
+            Self::deep_scan_sections(data, &mut sections);
+        }
+
+        // Deduplicate sections by title
+        let mut seen = std::collections::HashSet::new();
+        sections.retain(|s| seen.insert(s.title.clone()));
+
         sections
+    }
+
+    /// Fallback: walk the entire response value (bounded) collecting carousels,
+    /// shelves and grids wherever they live, so format changes in the outer
+    /// response keep individual shelves reachable instead of a blank feed.
+    fn deep_scan_sections(data: &serde_json::Value, out: &mut Vec<BrowseSection>) {
+        use std::collections::VecDeque;
+        let mut queue: VecDeque<&serde_json::Value> = VecDeque::new();
+        queue.push_back(data);
+        let mut budget = 6000usize;
+        while let Some(node) = queue.pop_front() {
+            budget -= 1;
+            if budget == 0 { break; }
+            if node.is_array() {
+                for item in node.as_array().unwrap() {
+                    queue.push_back(item);
+                }
+            } else if node.is_object() {
+                let obj = node.as_object().unwrap();
+                if let Some(carousel) = obj.get("musicCarouselShelfRenderer") {
+                    let title = carousel["header"]["musicCarouselShelfBasicHeaderRenderer"]
+                        ["title"]["runs"][0]["text"].as_str()
+                        .unwrap_or("Featured").to_string();
+                    let items = Self::parse_shelf_contents(&carousel["contents"]);
+                    if !items.is_empty() {
+                        out.push(BrowseSection { title, items });
+                    }
+                } else if let Some(shelf) = obj.get("musicShelfRenderer") {
+                    let title = Self::text_run(&shelf["title"]["runs"]);
+                    let title = if title.is_empty() { "Tracks".to_string() } else { title };
+                    let items = Self::parse_shelf_contents(&shelf["contents"]);
+                    if !items.is_empty() {
+                        out.push(BrowseSection { title, items });
+                    }
+                } else if let Some(grid) = obj.get("gridRenderer") {
+                    let items = Self::parse_shelf_contents(&grid["items"]);
+                    if !items.is_empty() {
+                        out.push(BrowseSection { title: "New Releases".to_string(), items });
+                    }
+                }
+                for v in obj.values() {
+                    queue.push_back(v);
+                }
+            }
+        }
     }
 
     // ── Public API ───────────────────────────────────────────────────────────
 
     pub async fn fetch_browse(&self, browse_id: &str) -> Vec<BrowseSection> {
-        let body = json!({
+        self.fetch_browse_paged(browse_id, "").await
+    }
+
+    /// Browse with optional continuation params (needed by genre/mood tiles).
+    pub async fn fetch_browse_paged(&self, browse_id: &str, params: &str) -> Vec<BrowseSection> {
+        let mut body = json!({
             "browseId": browse_id,
             "context": self.ctx()
         });
+        if !params.is_empty() {
+            body["params"] = json!(params);
+        }
         let Ok(resp) = self.client.post(Self::api_url("browse")).json(&body).send().await else {
             return vec![];
         };
@@ -427,6 +528,28 @@ impl InnerTubeClient {
 
     /// Fetch radio/autoplay queue for a given video, or playlist tracks if media_id starts with PL:
     pub async fn fetch_next_radio(&self, media_id: &str) -> Vec<TrackItem> {
+        // BROWSE:<browseId>|<params> — a genre/mood tile. Resolve the browse
+        // page and flatten its song tracks into a queue.
+        if let Some(rest) = media_id.strip_prefix("BROWSE:") {
+            let (browse_id, params) = rest.split_once('|')
+                .map(|(b, p)| (b.to_string(), p.to_string()))
+                .unwrap_or_else(|| (rest.to_string(), String::new()));
+            let sections = self.fetch_browse_paged(&browse_id, &params).await;
+            let mut tracks = Vec::new();
+            for s in &sections {
+                tracks.extend(
+                    s.items.iter()
+                        .filter(|t| !t.media_id.starts_with("BROWSE:"))
+                        .cloned(),
+                );
+            }
+            // Drop duplicate tracks while preserving order
+            let mut seen = std::collections::HashSet::new();
+            tracks.retain(|t| seen.insert(t.media_id.clone()));
+            println!("[InnerTube] browse-expanded {} → {} tracks", browse_id, tracks.len());
+            return tracks;
+        }
+
         let playlist_id = if media_id.starts_with("PL:") {
             media_id.strip_prefix("PL:").unwrap_or("").to_string()
         } else {

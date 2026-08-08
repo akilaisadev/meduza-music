@@ -1,0 +1,19 @@
+[package]
+name = "meduza-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meduza-core.workspace = true
+meduza-playback.workspace = true
+meduza-viewmodel.workspace = true
+eframe.workspace = true
+tokio.workspace = true
+image.workspace = true
+chrono.workspace = true
+tray-icon.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk.workspace = true

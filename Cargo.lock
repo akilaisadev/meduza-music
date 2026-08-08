@@ -2451,21 +2451,53 @@ dependencies = [
 ]
 
 [[package]]
-name = "meduza-music"
-version = "1.0.0"
+name = "meduza-core"
+version = "1.2.0"
 dependencies = [
- "chrono",
  "dirs",
- "eframe",
- "gtk",
- "image",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
- "tray-icon",
  "ureq",
  "url",
+]
+
+[[package]]
+name = "meduza-playback"
+version = "1.2.0"
+dependencies = [
+ "meduza-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ureq",
+]
+
+[[package]]
+name = "meduza-ui"
+version = "1.2.0"
+dependencies = [
+ "chrono",
+ "eframe",
+ "gtk",
+ "image",
+ "meduza-core",
+ "meduza-playback",
+ "meduza-viewmodel",
+ "serde_json",
+ "tokio",
+ "tray-icon",
+]
+
+[[package]]
+name = "meduza-viewmodel"
+version = "1.2.0"
+dependencies = [
+ "meduza-core",
+ "meduza-playback",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

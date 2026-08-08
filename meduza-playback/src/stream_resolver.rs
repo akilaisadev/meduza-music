@@ -4,7 +4,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::thread;
-use crate::settings::{self, Semaphore};
+use meduza_core::settings::{self, Semaphore};
 
 static URL_CACHE: OnceLock<Mutex<HashMap<String, (String, Instant)>>> = OnceLock::new();
 // IMP-6: Track whether disk cache has been loaded this session
@@ -123,7 +123,7 @@ impl StreamResolver {
 
     /// Resolves a direct audio CDN URL for a given YouTube video ID using yt-dlp.
     /// Uses ultra-fast in-memory caching (~0.001s) and direct resolution (~0.4s).
-    pub fn get_audio_url(video_id: &str, quality: crate::settings::AudioQuality) -> Option<String> {
+    pub fn get_audio_url(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
         // IMP-6: Ensure disk cache is loaded on first call this session
         if !DISK_CACHE_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
             Self::load_cache_from_disk();
@@ -143,9 +143,9 @@ impl StreamResolver {
         let url = format!("https://www.youtube.com/watch?v={}", video_id);
         
         let format_arg = match quality {
-            crate::settings::AudioQuality::DataSaver => "bestaudio[acodec=opus][abr<=70]/bestaudio[abr<=96]/bestaudio[ext=webm]",
-            crate::settings::AudioQuality::Normal    => "bestaudio[acodec=opus][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=webm]",
-            crate::settings::AudioQuality::High      => "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
+            meduza_core::settings::AudioQuality::DataSaver => "bestaudio[acodec=opus][abr<=70]/bestaudio[abr<=96]/bestaudio[ext=webm]",
+            meduza_core::settings::AudioQuality::Normal    => "bestaudio[acodec=opus][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=webm]",
+            meduza_core::settings::AudioQuality::High      => "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
         };
 
         // Bound concurrent yt-dlp processes (CPU overload guard).
@@ -192,7 +192,7 @@ impl StreamResolver {
     /// IMP-4: Racing resolver — launches two parallel yt-dlp resolution threads
     /// and returns whichever CDN URL arrives first. Ideal for the background
     /// preloader where we have time but want the fastest possible result.
-    pub fn get_audio_url_racing(video_id: &str, quality: crate::settings::AudioQuality) -> Option<String> {
+    pub fn get_audio_url_racing(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
         // Check cache first — instant, no threads needed
         let cache_key = format!("{}:{:?}", video_id, quality);
         {
@@ -213,7 +213,7 @@ impl StreamResolver {
 
         let vid1 = video_id.to_string();
         let tx1  = tx.clone();
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             if let Some(url) = Self::get_audio_url(&vid1, quality) {
                 let _ = tx1.send(url);
             }
@@ -222,7 +222,7 @@ impl StreamResolver {
         // Stagger second thread to avoid rate-limiting two simultaneous yt-dlp calls
         let vid2 = video_id.to_string();
         let tx2  = tx;
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             thread::sleep(Duration::from_millis(120));
             // Re-check cache first (Thread 1 may have already populated it)
             if let Some(url) = Self::get_audio_url(&vid2, quality) {

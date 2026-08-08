@@ -1,5 +1,5 @@
 # Cargo / Rust Build Artifacts
-/target
+/target/
 **/*.rs.bk
 
 # System & IDE Files
@@ -11,30 +11,24 @@
 *~
 *.log
 
-# Build & Packaging Artifacts
-/build/
-/build-dir/
-/repo/
-repo/
-.flatpak-build/
+# Python Cache (for utility scripts)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Flatpak & Packaging Build Directories
 .flatpak-builder/
-.flatpak-repo/
+build-dir/
+repo/
 *.flatpak
 *.deb
 *.rpm
 *.tar.gz
-/AppDir/
 *.AppImage
+AppDir/
 
-# Flutter / Dart dead code remnants
-.dart_tool/
-.flutter-plugins
-.flutter-plugins-dependencies
-.pub-cache/
-.pub/
-
-# Python Cache
-__pycache__/
-*.pyc
-linuxdeploy-x86_64.AppImage
-.AppImage
+# Local configuration / Scratch
+.env
+.env.local
+scratch/
+tmp/

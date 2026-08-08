@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::innertube::{InnerTubeClient, TrackItem};
-use crate::settings;
+use meduza_core::innertube::{InnerTubeClient, TrackItem};
+use meduza_core::settings;
 use crate::stream_resolver::StreamResolver;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -46,10 +46,10 @@ pub struct PlaybackManager {
     pub repeat_mode:   Arc<Mutex<RepeatMode>>,
     pub liked_songs:           Arc<Mutex<Vec<TrackItem>>>,
     pub history:               Arc<Mutex<Vec<TrackItem>>>,
-    pub settings:              Arc<Mutex<crate::settings::AppSettings>>,
+    pub settings:              Arc<Mutex<meduza_core::settings::AppSettings>>,
     pub stream_cache:          Arc<Mutex<Option<(String, String)>>>,
-    pub data_saver:            Arc<Mutex<crate::data_saver::DataSaver>>,
-    pub recommendation_engine: Arc<Mutex<crate::recommendation_engine::RecommendationEngine>>,
+    pub data_saver:            Arc<Mutex<meduza_core::data_saver::DataSaver>>,
+    pub recommendation_engine: Arc<Mutex<meduza_core::recommendation_engine::RecommendationEngine>>,
     pub playback_seq:          Arc<AtomicU64>,
     // BUG-01: shared paused flag for IPC reconnect re-send
     is_paused_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -111,14 +111,14 @@ impl PlaybackManager {
         let duration      = Arc::new(Mutex::new(0.0f32));
         let track_ended   = Arc::new(Mutex::new(false));
         let mpv_proc      = Arc::new(Mutex::new(None::<Child>));
-        let settings      = Arc::new(Mutex::new(crate::settings::AppSettings::load()));
+        let settings      = Arc::new(Mutex::new(meduza_core::settings::AppSettings::load()));
         let current_track = Arc::new(Mutex::new(None));
         let queue         = Arc::new(Mutex::new(Vec::<QueueItem>::new()));
         let queue_index   = Arc::new(Mutex::new(0));
         let stream_cache          = Arc::new(Mutex::new(None));
         let history               = Arc::new(Mutex::new(Vec::<TrackItem>::new()));
-        let data_saver            = Arc::new(Mutex::new(crate::data_saver::DataSaver::new()));
-        let recommendation_engine = Arc::new(Mutex::new(crate::recommendation_engine::RecommendationEngine::new()));
+        let data_saver            = Arc::new(Mutex::new(meduza_core::data_saver::DataSaver::new()));
+        let recommendation_engine = Arc::new(Mutex::new(meduza_core::recommendation_engine::RecommendationEngine::new()));
         let volume        = Arc::new(Mutex::new(80.0f32));
         let is_shuffle    = Arc::new(Mutex::new(false));
         let repeat_mode   = Arc::new(Mutex::new(RepeatMode::Off));
@@ -145,6 +145,12 @@ impl PlaybackManager {
             let mut stream_opt: Option<BufReader<UnixStream>> = None;
             let mut was_connected = false;
             let mut expecting_playlist_reset = false;
+            // MPV-DEATH WATCHDOG: if mpv dies (socket gone) while state is
+            // Playing, `eof-reached` never arrives, so without this check the
+            // state stays Playing forever and the UI keeps repainting at 10fps
+            // (permanent ~40% CPU / "Not Responding" window).
+            let mut conn_refused_cycles: u32 = 0;
+            let mut dead_advance_signalled = false;
             loop {
                 thread::sleep(Duration::from_millis(100));
 
@@ -170,6 +176,31 @@ impl PlaybackManager {
                     }
                 }
                 was_connected = now_connected;
+
+                // MPV-DEATH WATCHDOG (see declaration above).
+                if !now_connected {
+                    conn_refused_cycles += 1;
+                    if conn_refused_cycles >= 20 && !dead_advance_signalled {
+                        // ~2s of unconnectable mpv while we claim "Playing".
+                        dead_advance_signalled = true;
+                        if lk!(queue_bg).is_empty() {
+                            *lk!(state_bg) = PlaybackState::Idle;
+                            println!("[Playback] mpv is gone and queue is empty → Idle (stopping UI repaint spin).");
+                        } else {
+                            // Ask the UI thread (single auto-advance authority)
+                            // to restart mpv and move on to the next track.
+                            let mut f = lk!(ended_bg);
+                            if !*f {
+                                *f = true;
+                                println!("[Playback] mpv died mid-playback → triggering auto-advance to next track.");
+                            }
+                        }
+                        continue;
+                    }
+                } else {
+                    conn_refused_cycles = 0;
+                    dead_advance_signalled = false;
+                }
 
                 // BUG-02: Guard flag — if gapless transition fired this cycle, skip EOF handling
                 let mut gapless_transitioned = false;
@@ -262,6 +293,14 @@ impl PlaybackManager {
             }
         });
 
+        let mut loaded_liked = Vec::new();
+        let liked_path = meduza_core::settings::app_config_dir().join("liked_songs.json");
+        if let Ok(json_str) = std::fs::read_to_string(&liked_path) {
+            if let Ok(parsed) = serde_json::from_str::<Vec<TrackItem>>(&json_str) {
+                loaded_liked = parsed;
+            }
+        }
+
         Self {
             state,
             current_track,
@@ -273,7 +312,7 @@ impl PlaybackManager {
             track_ended,
             is_shuffle,
             repeat_mode,
-            liked_songs:   Arc::new(Mutex::new(Vec::new())),
+            liked_songs:   Arc::new(Mutex::new(loaded_liked)),
             history,
             settings,
             stream_cache,
@@ -325,17 +364,18 @@ impl PlaybackManager {
         let current_track_c = Arc::clone(&self.current_track);
         let duration_c   = Arc::clone(&self.duration_secs);
 
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
             let mut vid = video_id.clone();
             let mut play_title = title.clone();
             let mut track_to_reco = track_cl.clone();
 
-            // If it's a playlist, fetch its tracks and play the first one!
-            if vid.starts_with("PL:") {
+            // If it's a playlist or a genre/mood browse tile, fetch its tracks
+            // and play the first one!
+            if vid.starts_with("PL:") || vid.starts_with("BROWSE:") {
                 println!("[Playback] Resolving playlist: {}", play_title);
-                let playlist_tracks = crate::workers::block_on(inner_c.fetch_next_radio(&vid));
+                let playlist_tracks = meduza_core::workers::block_on(inner_c.fetch_next_radio(&vid));
                 if seq_c.load(Ordering::SeqCst) != seq { return; }
                 
                 if playlist_tracks.is_empty() {
@@ -403,8 +443,8 @@ impl PlaybackManager {
             }
         });
 
-        // Only trigger preloader for real tracks (not playlist markers)
-        if !track.media_id.starts_with("PL:") {
+        // Only trigger preloader for real tracks (not playlist/browse markers)
+        if !track.media_id.starts_with("PL:") && !track.media_id.starts_with("BROWSE:") {
             // Immediately trigger background preloader (waits until Playing state)
             self.trigger_background_preloader(track.clone());
 
@@ -417,9 +457,9 @@ impl PlaybackManager {
             let seq_val     = seq;
             let quality_w   = lk!(self.settings).audio_quality;
 
-            crate::workers::download().submit(move || {
+            meduza_core::workers::download().submit(move || {
                 if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
-                let radio = crate::workers::block_on(innertube_c.fetch_next_radio(&track_c.media_id));
+                let radio = meduza_core::workers::block_on(innertube_c.fetch_next_radio(&track_c.media_id));
                 if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
                 // Warm next 2 URLs before populating queue so skips are instant
                 let warm_ids: Vec<String> = radio.iter().take(2).map(|t| t.media_id.clone()).collect();
@@ -559,8 +599,11 @@ impl PlaybackManager {
         let cache_c  = Arc::clone(&self.stream_cache);
         let title    = track.title.clone();
         let settings_c2 = Arc::clone(&self.settings);
+        let ended_c  = Arc::clone(&self.track_ended);
+        let queue_c  = Arc::clone(&self.queue);
+        let idx_c    = Arc::clone(&self.queue_index);
 
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
             ensure_mpv_running(&mpv_proc, lk!(settings_c2).mpv_small_buffer());
@@ -584,7 +627,20 @@ impl PlaybackManager {
                 url
             } else {
                 if seq_c.load(Ordering::SeqCst) == seq {
-                    *lk!(state_c) = PlaybackState::Error("Could not resolve stream URL".to_string());
+                    println!("[Playback] Stream resolution failed for '{}'. Auto-skipping broken track.", title);
+                    {
+                        let mut q = lk!(queue_c);
+                        let mut i = lk!(idx_c);
+                        if *i < q.len() && q[*i].track.media_id == video_id {
+                            q.remove(*i);
+                            // Keep index same so the next track slides into this index, but if we were at the end, clamp it
+                            if *i >= q.len() && *i > 0 {
+                                *i -= 1;
+                            }
+                        }
+                    }
+                    *lk!(state_c) = PlaybackState::Error(format!("Could not resolve stream URL for {}. Skipping...", title));
+                    *lk!(ended_c) = true; // Triggers handle_auto_advance
                 }
                 return;
             };
@@ -625,8 +681,8 @@ impl PlaybackManager {
         shuf_c: Arc<Mutex<bool>>,
         curr_c: Arc<Mutex<Option<TrackItem>>>,
         state_c: Arc<Mutex<PlaybackState>>,
-        settings_c: Arc<Mutex<crate::settings::AppSettings>>,
-        data_saver_c: Arc<Mutex<crate::data_saver::DataSaver>>,
+        settings_c: Arc<Mutex<meduza_core::settings::AppSettings>>,
+        data_saver_c: Arc<Mutex<meduza_core::data_saver::DataSaver>>,
         progress_c: Arc<Mutex<f32>>,
         duration_c: Arc<Mutex<f32>>,
         current_track: TrackItem,
@@ -634,10 +690,10 @@ impl PlaybackManager {
         let vid_c = current_track.media_id.clone();
         // Use download pool (long-running sleeps) — io pool is for short latency work.
         // We keep the preloader on download to avoid starving URL resolves on the io pool.
-        crate::workers::download().submit(move || {
+        meduza_core::workers::download().submit(move || {
             let (quality, is_data_saver) = {
                 let s = lk!(settings_c);
-                (s.audio_quality, s.audio_quality == crate::settings::AudioQuality::DataSaver)
+                (s.audio_quality, s.audio_quality == meduza_core::settings::AudioQuality::DataSaver)
             };
 
             // IMP-2: Short bounded wait (max 2s) instead of infinite loop.
@@ -760,11 +816,11 @@ impl PlaybackManager {
         video_id: String,
         seq_val: u64,
         seq_arc: Arc<AtomicU64>,
-        quality: crate::settings::AudioQuality,
+        quality: meduza_core::settings::AudioQuality,
     ) {
-        crate::workers::download().submit(move || {
+        meduza_core::workers::download().submit(move || {
             if seq_arc.load(Ordering::SeqCst) != seq_val { return; }
-            let radio_tracks = crate::workers::block_on(innertube.fetch_next_radio(&video_id));
+            let radio_tracks = meduza_core::workers::block_on(innertube.fetch_next_radio(&video_id));
             if seq_arc.load(Ordering::SeqCst) != seq_val { return; }
             if radio_tracks.is_empty() { return; }
 
@@ -793,9 +849,9 @@ impl PlaybackManager {
     /// IMP-1: Speculatively pre-resolve CDN URLs for upcoming tracks.
     /// Results are stored in StreamResolver's in-memory + disk cache so
     /// subsequent play/skip calls are instant (0.001s) cache hits.
-    pub fn warm_url_cache_in_bg(video_ids: Vec<String>, quality: crate::settings::AudioQuality) {
+    pub fn warm_url_cache_in_bg(video_ids: Vec<String>, quality: meduza_core::settings::AudioQuality) {
         if video_ids.is_empty() { return; }
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             for (i, vid) in video_ids.into_iter().enumerate() {
                 // Stagger to avoid simultaneous yt-dlp processes
                 if i > 0 { thread::sleep(Duration::from_millis(800)); }
@@ -812,8 +868,8 @@ impl PlaybackManager {
         curr_c: Arc<Mutex<Option<TrackItem>>>,
         state_c: Arc<Mutex<PlaybackState>>,
         cache_c: Arc<Mutex<Option<(String, String)>>>,
-        ds_c: Arc<Mutex<crate::data_saver::DataSaver>>,
-        settings_c: Arc<Mutex<crate::settings::AppSettings>>,
+        ds_c: Arc<Mutex<meduza_core::data_saver::DataSaver>>,
+        settings_c: Arc<Mutex<meduza_core::settings::AppSettings>>,
         duration_c: Arc<Mutex<f32>>,
         progress_c: Arc<Mutex<f32>>,
         ended_c: Arc<Mutex<bool>>,
@@ -870,7 +926,7 @@ impl PlaybackManager {
         let state_c_spawn    = Arc::clone(&state_c);
         let mpv_proc_spawn   = Arc::clone(&mpv_proc);
 
-        crate::workers::io().submit(move || {
+        meduza_core::workers::io().submit(move || {
             ensure_mpv_running(&mpv_proc_spawn, lk!(settings_c_spawn).mpv_small_buffer());
 
             let cached_url = {
@@ -972,6 +1028,14 @@ impl PlaybackManager {
             liked.remove(pos);
         } else {
             liked.push(track);
+        }
+        
+        let path = meduza_core::settings::app_config_dir().join("liked_songs.json");
+        if let Ok(json_str) = serde_json::to_string(&*liked) {
+            std::thread::spawn(move || {
+                meduza_core::settings::ensure_private_dir(&path);
+                let _ = std::fs::write(&path, json_str);
+            });
         }
     }
 

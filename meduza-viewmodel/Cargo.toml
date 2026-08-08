@@ -1,0 +1,11 @@
+[package]
+name = "meduza-viewmodel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meduza-core.workspace = true
+meduza-playback.workspace = true
+tokio.workspace = true
+serde_json.workspace = true

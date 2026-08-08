@@ -1,7 +1,9 @@
 app-id: org.meduzamusic.MeduzaMusic
 runtime: org.freedesktop.Platform
-runtime-version: '23.08'
+runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: meduza-music
 finish-args:
   - --share=network
@@ -14,6 +16,7 @@ finish-args:
 build-options:
   build-args:
     - --share=network
+  append-path: /usr/lib/sdk/rust-stable/bin
   env:
     CARGO_HOME: /run/build/meduza-music/cargo
 modules:
@@ -26,18 +29,14 @@ modules:
     buildsystem: simple
     build-commands:
       # Use an AppImage or static build of mpv for simplicity in this local flatpak
-      - wget https://github.com/stps/mpv-appimage/releases/download/v0.38.0/mpv-0.38.0-x86_64.AppImage -O mpv
+      - wget https://github.com/ivan-hc/MPV-appimage/releases/download/continuous/mpv-Media-Player_0.41.0-3-archimage5.0-x86_64.AppImage -O mpv
+      - chmod +x mpv
       - install -D -m 755 mpv /app/bin/mpv
-  - name: rust-extension
-    buildsystem: simple
-    build-commands:
-      # Install Rust toolchain
-      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
   - name: meduza-music
     buildsystem: simple
     build-commands:
-      - export PATH="$HOME/.cargo/bin:$PATH" && cargo build --release
-      - install -D -m 755 target/release/meduza-music /app/bin/meduza-music
+      - cargo build --release
+      - install -D -m 755 target/release/meduza-ui /app/bin/meduza-music
       - install -D -m 644 org.meduzamusic.MeduzaMusic.desktop /app/share/applications/org.meduzamusic.MeduzaMusic.desktop
       - install -D -m 644 logo.png /app/share/icons/hicolor/512x512/apps/org.meduzamusic.MeduzaMusic.png
     sources:

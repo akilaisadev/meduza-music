@@ -1,0 +1,12 @@
+[package]
+name = "meduza-playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+meduza-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ureq.workspace = true

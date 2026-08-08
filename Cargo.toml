@@ -1,10 +1,18 @@
-[package]
-name = "meduza-music"
+[workspace]
+members = [
+    "meduza-core",
+    "meduza-playback",
+    "meduza-viewmodel",
+    "meduza-ui"
+]
+resolver = "2"
+
+[workspace.package]
 version = "1.2.0"
 edition = "2021"
 license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
 eframe = { version = "0.26", features = ["default"] }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls", "gzip", "blocking"] }
 tokio = { version = "1.0", features = ["full"] }
@@ -16,6 +24,8 @@ dirs = "5.0"
 chrono = "0.4"
 url = "2.5"
 tray-icon = { version = "0.14", default-features = false }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
+
+meduza-core = { path = "meduza-core" }
+meduza-playback = { path = "meduza-playback" }
+meduza-viewmodel = { path = "meduza-viewmodel" }

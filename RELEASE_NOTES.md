@@ -1,43 +1,15 @@
-# 🎵 Meduza Music v1.0.0 Release
+# 🎵 Meduza Music v1.2.0 
 
-Welcome to the official **v1.0.0 release** of **Meduza Music**! Meduza Music is a fast, lightweight, and modern desktop music player built with Rust, `eframe`/`egui`, and InnerTube API integration with `mpv` audio backend.
+## What's New
+- **Lazy Loading Implementation**: The home feed grid now utilizes aggressive lazy loading and view-culling, drastically reducing GPU/CPU consumption and completely eliminating scrolling flicker on large libraries!
+- **Library Saving Architecture Fix**: Liked tracks and your history are no longer cross-filtered. Saving a track correctly adds it to your "Your Library" view without latency.
+- **Improved Background Threading**: "Like" toggling has been moved to a background thread to prevent UI freezing.
+- **Robust Auto-Skipping**: Broken YouTube Music stream resolutions or dead tracks now automatically skip and gracefully remove themselves from your playback queue to prevent silent hang-ups.
+- **Streamlined UI Layout**: The visual padding and home feed elements have been refined for a sleeker, more premium look.
 
----
+## Installation
+You can install this update by downloading the `.flatpak` bundle below and running:
 
-### ✨ Features & Improvements
-
-- **🏠 Interactive & Smooth Home Feed**:
-  - Personalized music shelves (Jump back in, Heavy rotation, Listening history, Top Artists & mixes).
-  - High-contrast, always-visible scrollbar UI for smooth navigation through discovery shelves.
-
-- **🔍 YouTube Music Search & Discovery**:
-  - Instant search suggestions and real-time results for tracks, artists, and mixes.
-  - Dedicated browse categories and genre grid.
-
-- **⚡ Instant Playback Engine**:
-  - `mpv` IPC audio player integration with stream resolving and zero-latency background pre-loading.
-  - Built-in Data Saver & offline replay caching engine.
-
-- **🎨 Modern UI & System Tray Integration**:
-  - Dark mode glassmorphic UI, album art caching, and spinning vinyl disc animation.
-  - System tray icon support (minimize to tray).
-
----
-
-### 📦 Installation Guide (Linux AppImage)
-
-#### 1. Download
-Download the latest `Meduza_Music-*-x86_64.AppImage` from the release assets.
-
-#### 2. Make it executable & launch
 ```bash
-chmod +x Meduza_Music-*.AppImage
-./Meduza_Music-*.AppImage
+flatpak install --user Meduza_Music-1.2.0-x86_64.flatpak
 ```
-
-#### 3. Run from anywhere
-Move the AppImage to your `~/bin` folder (or any folder in `PATH`) so a
-`meduza-music` shell alias launches it from the terminal.
-
-> Note: AppImage is the only packaged format supported. For system-level
-> installs, build from source with `cargo build --release`.

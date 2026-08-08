@@ -1,12 +1,12 @@
-# 🎵 Meduza Music
+# 🎵 Meduza Music: The Ultimate Native Linux Music Player
 
 <p align="center">
   <img src="assets/icon_512.png" width="128" alt="Meduza Music Logo" />
 </p>
 
 <p align="center">
-  <b>A fast, native, lightweight desktop YouTube Music player for Linux.</b><br />
-  <i>Crafted with Rust, egui, and MPV for smooth audio streaming, zero lag, and minimal resource usage.</i>
+  <b>A blazing fast, native, lightweight desktop YouTube Music player for Linux.</b><br />
+  <i>Crafted with Rust, egui, and MPV for smooth audio streaming, zero lag, and minimal resource usage. The perfect Flatpak music player for your Linux desktop environment.</i>
 </p>
 
 <p align="center">
@@ -14,6 +14,7 @@
   <a href="https://github.com/akilaisadev/meduza-music/stargazers"><img src="https://img.shields.io/github/stars/akilaisadev/meduza-music?style=for-the-badge&color=E95420" alt="Stars" /></a>
   <img src="https://img.shields.io/badge/Built%20With-Rust-000000?style=for-the-badge&logo=rust" alt="Rust" />
   <img src="https://img.shields.io/badge/Audio-MPV%20IPC-044B94?style=for-the-badge" alt="MPV" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20Flatpak-5C2D91?style=for-the-badge&logo=linux" alt="Linux Flatpak" />
 </p>
 
 ---

@@ -55,7 +55,7 @@ pub fn app_cache_root() -> PathBuf {
 }
 
 /// Return the current user's real UID (read from /proc on Linux).
-pub(crate) fn current_uid() -> Option<u32> {
+pub fn current_uid() -> Option<u32> {
     let status = fs::read_to_string("/proc/self/status").ok()?;
     for line in status.lines() {
         if let Some(vals) = line.strip_prefix("Uid:") {
@@ -184,7 +184,6 @@ pub fn fetch_allowed(
     let agent = AGENT.get_or_init(|| {
         ureq::builder()
             .redirects(0)
-            .https_only(true)
             .build()
     });
 

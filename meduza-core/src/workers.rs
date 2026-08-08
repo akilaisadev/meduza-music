@@ -62,13 +62,7 @@ impl WorkerPool {
     /// low on low-end machines; the decode pool uses a bigger stack because
     /// image decoders (esp. WebP) can be deep-stack recursive.
     pub fn new(name: &'static str, threads: usize, stack_kib: usize) -> Self {
-        // Generous queue headroom (threads * 8): play/advance/warmup jobs are
-        // then never dropped in practice, while a slammed pool still sheds
-        // work instead of unbounded-queuing stale jobs. Deliberately NOT a
-        // blocking API — a blocking enqueue from the UI or poller thread would
-        // stall behind long io jobs (e.g. URL warm-ups) and playback/app would
-        // appear frozen.
-        let queue = Arc::new(JobQueue::new(threads * 8));
+        let queue = Arc::new(JobQueue::new(threads * 32));
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let q = Arc::clone(&queue);
@@ -100,7 +94,7 @@ impl WorkerPool {
 /// stream-URL warm-ups, resolve+play, auto-advance.
 fn io_pool() -> &'static WorkerPool {
     static IO: OnceLock<WorkerPool> = OnceLock::new();
-    IO.get_or_init(|| WorkerPool::new("io", 4, 512))
+    IO.get_or_init(|| WorkerPool::new("io", 2, 512))
 }
 
 /// Long-running background work that holds a thread for a long time: data
@@ -108,19 +102,28 @@ fn io_pool() -> &'static WorkerPool {
 /// big download can never block a stream resolve.
 fn download_pool() -> &'static WorkerPool {
     static DL: OnceLock<WorkerPool> = OnceLock::new();
-    DL.get_or_init(|| WorkerPool::new("dl", 4, 512))
+    DL.get_or_init(|| WorkerPool::new("dl", 1, 512))
 }
 
 /// CPU-heavy decodes (image decode → RGBA, dominant-color extraction).
 /// Larger stack: image decoders (notably WebP) recurse deeply.
 fn decode_pool() -> &'static WorkerPool {
     static DECODE: OnceLock<WorkerPool> = OnceLock::new();
-    DECODE.get_or_init(|| WorkerPool::new("decode", 1, 1024))
+    DECODE.get_or_init(|| WorkerPool::new("decode", 2, 1024))
+}
+
+/// Dedicated network I/O for fetching images. Placed in a separate pool so that
+/// loading 50 album images on the home screen doesn't block the `io` pool from
+/// resolving a stream or handling latency-sensitive API requests.
+fn image_fetch_pool() -> &'static WorkerPool {
+    static IFETCH: OnceLock<WorkerPool> = OnceLock::new();
+    IFETCH.get_or_init(|| WorkerPool::new("img", 6, 1024))
 }
 
 pub fn io() -> &'static WorkerPool { io_pool() }
 pub fn download() -> &'static WorkerPool { download_pool() }
 pub fn decode() -> &'static WorkerPool { decode_pool() }
+pub fn image_fetch() -> &'static WorkerPool { image_fetch_pool() }
 
 // ── Shared Tokio runtime for all InnerTube (async) work ─────────────────────
 // Previously a brand-new current-thread runtime was created inside every
@@ -131,7 +134,7 @@ pub fn runtime() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(4)
+            .worker_threads(2)
             .enable_all()
             .build()
             .expect("failed to start shared Tokio runtime")
