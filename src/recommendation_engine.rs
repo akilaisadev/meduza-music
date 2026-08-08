@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::innertube::TrackItem;
+use crate::settings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackScore {
@@ -27,10 +28,8 @@ pub struct RecommendationEngine {
 
 impl RecommendationEngine {
     pub fn new() -> Self {
-        let dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("meduza-music");
-        let _ = fs::create_dir_all(&dir);
+        let dir = settings::app_config_dir();
+        settings::ensure_private_dir(&dir);
         let path = dir.join("user_taste.json");
 
         let profile = if path.exists() {
@@ -47,7 +46,7 @@ impl RecommendationEngine {
 
     pub fn save(&self) {
         if let Ok(data) = serde_json::to_string_pretty(&self.profile) {
-            let _ = fs::write(&self.config_path, data);
+            let _ = settings::write_private(&self.config_path, &data);
         }
     }
 

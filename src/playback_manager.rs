@@ -1,5 +1,7 @@
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -7,6 +9,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::innertube::{InnerTubeClient, TrackItem};
+use crate::settings;
 use crate::stream_resolver::StreamResolver;
 
 #[derive(Clone, PartialEq, Debug)]
@@ -55,13 +58,36 @@ pub struct PlaybackManager {
     innertube:   Arc<InnerTubeClient>,
 }
 
-/// Returns the mpv IPC socket path. Uses XDG_RUNTIME_DIR (shared between
-/// the Flatpak sandbox and the host-spawned mpv process).
-fn socket_path() -> String {
-    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-    let path = format!("{}/meduza-music", dir);
-    let _ = std::fs::create_dir_all(&path);
-    format!("{}/mpv.sock", path)
+/// Returns the mpv IPC socket path.
+///
+/// Security: the socket lives in a user-private runtime directory (0700) and is
+/// chmod'd 0600 (see ensure_mpv_running) so that no other local user can
+/// connect and issue commands to mpv (which supports arbitrary `run`/`loadfile`
+/// commands). The directory is chosen via settings::runtime_dir(), which only
+/// trusts XDG_RUNTIME_DIR when it is owned by the user and not
+/// group/world-writable — it NEVER falls back to world-writable /tmp.
+fn socket_path() -> PathBuf {
+    settings::runtime_dir().join("mpv.sock")
+}
+
+/// Path of the PID file tracking the mpv process we spawned.
+fn mpv_pid_path() -> PathBuf {
+    settings::runtime_dir().join("mpv.pid")
+}
+
+/// Connect to the mpv IPC socket. Refuses symlinked sockets and sockets not
+/// owned by the current user, closing the race where a planted file could
+/// redirect our commands to an attacker-controlled listener.
+fn connect_mpv() -> Option<UnixStream> {
+    let path = socket_path();
+    let meta = std::fs::symlink_metadata(&path).ok()?;
+    if !meta.file_type().is_socket() {
+        return None;
+    }
+    if meta.uid() != settings::current_uid().unwrap_or(u32::MAX) {
+        return None;
+    }
+    UnixStream::connect(&path).ok()
 }
 
 /// Poison-safe mutex lock helper — recovers the guard even if a previous
@@ -315,10 +341,10 @@ impl PlaybackManager {
         let track_cl     = track.clone();
         let settings_c   = Arc::clone(&self.settings);
 
-        thread::spawn(move || {
+crate::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
-            ensure_mpv_running(&mpv_proc);
+            ensure_mpv_running(&mpv_proc, lk!(settings_c).mpv_small_buffer());
 
             // Record user taste activity
             lk!(reco_c).record_play(track_cl);
@@ -354,12 +380,12 @@ impl PlaybackManager {
             println!("[Playback] Streaming: '{}' ({})", title, video_id);
 
             // Cache stream to disk in background if enabled in settings
-            let (enable_cache, max_cap) = {
+            let (enable_cache, max_cap, pace) = {
                 let s = lk!(settings_c);
-                (s.enable_cache, s.max_cache_size_mb)
+                (s.enable_cache, s.max_cache_size_mb, s.pace_downloads())
             };
             if enable_cache {
-                lk!(data_saver_c).cache_stream_in_bg(video_id, url, max_cap);
+                lk!(data_saver_c).cache_stream_in_bg(video_id, url, max_cap, pace);
             }
         });
 
@@ -375,11 +401,9 @@ impl PlaybackManager {
         let seq_val     = seq;
         let quality_w   = lk!(self.settings).audio_quality;
 
-        thread::spawn(move || {
+        crate::workers::download().submit(move || {
             if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all().build().unwrap();
-            let radio = rt.block_on(innertube_c.fetch_next_radio(&track_c.media_id));
+            let radio = crate::workers::block_on(innertube_c.fetch_next_radio(&track_c.media_id));
             if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
             // Warm next 2 URLs before populating queue so skips are instant
             let warm_ids: Vec<String> = radio.iter().take(2).map(|t| t.media_id.clone()).collect();
@@ -514,11 +538,12 @@ impl PlaybackManager {
         let quality  = lk!(self.settings).audio_quality;
         let cache_c  = Arc::clone(&self.stream_cache);
         let title    = track.title.clone();
+        let settings_c2 = Arc::clone(&self.settings);
 
-        thread::spawn(move || {
+        crate::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
-            ensure_mpv_running(&mpv_proc);
+            ensure_mpv_running(&mpv_proc, lk!(settings_c2).mpv_small_buffer());
             println!("[Playback] Resolving stream for '{}' ({})", title, video_id);
             
             let cached_url = {
@@ -587,7 +612,7 @@ impl PlaybackManager {
         current_track: TrackItem,
     ) {
         let vid_c = current_track.media_id.clone();
-        thread::spawn(move || {
+        crate::workers::download().submit(move || {
             let (quality, is_data_saver) = {
                 let s = lk!(settings_c);
                 (s.audio_quality, s.audio_quality == crate::settings::AudioQuality::DataSaver)
@@ -645,9 +670,16 @@ impl PlaybackManager {
                 println!("[Preloader] 0-Data disk cache hit for next: '{}'", next_title);
                 Some(local_path)
             } else {
-                // IMP-4: Racing resolver — two parallel threads, first URL wins
-                println!("[Preloader] Racing-resolve next: '{}' ({})", next_title, next_vid);
-                StreamResolver::get_audio_url_racing(&next_vid, quality)
+                // IMP-4: Racing resolver — two parallel threads, first URL wins.
+                // Race only when CPU headroom allows (disabled by low-end mode).
+                let racing = lk!(settings_c).resolve_racing();
+                if racing {
+                    println!("[Preloader] Racing-resolve next: '{}' ({})", next_title, next_vid);
+                    StreamResolver::get_audio_url_racing(&next_vid, quality)
+                } else {
+                    println!("[Preloader] Resolve next: '{}' ({})", next_title, next_vid);
+                    StreamResolver::get_audio_url(&next_vid, quality)
+                }
             };
 
             let Some(url) = stream_url else { return; };
@@ -708,13 +740,9 @@ impl PlaybackManager {
         seq_arc: Arc<AtomicU64>,
         quality: crate::settings::AudioQuality,
     ) {
-        thread::spawn(move || {
+        crate::workers::download().submit(move || {
             if seq_arc.load(Ordering::SeqCst) != seq_val { return; }
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-                Ok(r) => r,
-                Err(_) => return,
-            };
-            let radio_tracks = rt.block_on(innertube.fetch_next_radio(&video_id));
+            let radio_tracks = crate::workers::block_on(innertube.fetch_next_radio(&video_id));
             if seq_arc.load(Ordering::SeqCst) != seq_val { return; }
             if radio_tracks.is_empty() { return; }
 
@@ -745,7 +773,7 @@ impl PlaybackManager {
     /// subsequent play/skip calls are instant (0.001s) cache hits.
     pub fn warm_url_cache_in_bg(video_ids: Vec<String>, quality: crate::settings::AudioQuality) {
         if video_ids.is_empty() { return; }
-        thread::spawn(move || {
+        crate::workers::io().submit(move || {
             for (i, vid) in video_ids.into_iter().enumerate() {
                 // Stagger to avoid simultaneous yt-dlp processes
                 if i > 0 { thread::sleep(Duration::from_millis(800)); }
@@ -820,8 +848,8 @@ impl PlaybackManager {
         let state_c_spawn    = Arc::clone(&state_c);
         let mpv_proc_spawn   = Arc::clone(&mpv_proc);
 
-        thread::spawn(move || {
-            ensure_mpv_running(&mpv_proc_spawn);
+        crate::workers::io().submit(move || {
+            ensure_mpv_running(&mpv_proc_spawn, lk!(settings_c_spawn).mpv_small_buffer());
 
             let cached_url = {
                 let mut c = lk!(cache_c_spawn);
@@ -853,12 +881,12 @@ impl PlaybackManager {
             *lk!(state_c_spawn) = PlaybackState::Playing;
             println!("[Playback] Auto-advanced to: '{}'", title);
 
-            let (enable_cache, max_cap) = {
+            let (enable_cache, max_cap, pace) = {
                 let s = lk!(settings_c_spawn);
-                (s.enable_cache, s.max_cache_size_mb)
+                (s.enable_cache, s.max_cache_size_mb, s.pace_downloads())
             };
             if enable_cache {
-                lk!(ds_c_spawn).cache_stream_in_bg(video_id, stream_url, max_cap);
+                lk!(ds_c_spawn).cache_stream_in_bg(video_id, stream_url, max_cap, pace);
             }
         });
 
@@ -972,7 +1000,7 @@ fn ipc_get_status(stream_opt: &mut Option<BufReader<UnixStream>>) -> MpvStatus {
     };
 
     if stream_opt.is_none() {
-        if let Ok(s) = UnixStream::connect(socket_path()) {
+        if let Some(s) = connect_mpv() {
             s.set_write_timeout(Some(Duration::from_millis(100))).ok();
             // BUG-04/11: Reduce read timeout from 150ms to 50ms to reduce worst-case blocking
             s.set_read_timeout(Some(Duration::from_millis(50))).ok();
@@ -1025,7 +1053,7 @@ fn ipc_get_status(stream_opt: &mut Option<BufReader<UnixStream>>) -> MpvStatus {
 
 /// Direct synchronous IPC write to socket (instant, zero OS thread overhead).
 fn ipc_send(cmd: serde_json::Value) {
-    if let Ok(mut s) = UnixStream::connect(socket_path()) {
+    if let Some(mut s) = connect_mpv() {
         s.set_write_timeout(Some(Duration::from_millis(100))).ok();
         let mut msg = cmd.to_string();
         msg.push('\n');
@@ -1035,7 +1063,7 @@ fn ipc_send(cmd: serde_json::Value) {
 
 /// BUG-09: Reliable IPC send — returns true only if write succeeded.
 fn ipc_send_reliable(cmd: serde_json::Value) -> bool {
-    if let Ok(mut s) = UnixStream::connect(socket_path()) {
+    if let Some(mut s) = connect_mpv() {
         s.set_write_timeout(Some(Duration::from_millis(100))).ok();
         let mut msg = cmd.to_string();
         msg.push('\n');
@@ -1044,22 +1072,22 @@ fn ipc_send_reliable(cmd: serde_json::Value) -> bool {
     false
 }
 
+/// Kill a previous meduza-music mpv instance. Uses a PID file we write when
+/// spawning mpv, and only sends SIGTERM after verifying the process cmdline
+/// actually matches our own socket — never a broad `pkill -f` pattern.
 fn kill_stale_mpv() {
-    let is_flatpak = std::path::Path::new("/.flatpak-info").exists();
-    let mut cmd = if is_flatpak {
-        let mut c = Command::new("flatpak-spawn");
-        c.args(["--host", "pkill", "-f", "input-ipc-server=.*meduza-music/mpv.sock"]);
-        c
-    } else {
-        let mut c = Command::new("pkill");
-        c.args(["-f", "input-ipc-server=.*meduza-music/mpv.sock"]);
-        c
-    };
-    let _ = cmd.output();
+    let Ok(pid_str) = std::fs::read_to_string(mpv_pid_path()) else { return; };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else { return; };
+    let cmdline = std::fs::read_to_string(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
+    if cmdline.contains("input-ipc-server") && cmdline.contains("meduza-music") {
+        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+    }
 }
 
-/// Launch mpv idle process if not already running.
-fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>) {
+/// Launch mpv idle process if not already running. `small_buffer` (low-end
+/// profile) trades a little read-ahead/ahead-caching for a smaller resident
+/// memory footprint and gentler disk/network usage.
+fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: bool) {
     let mut proc = lk!(mpv_process);
     if let Some(ref mut child) = *proc {
         if child.try_wait().ok().flatten().is_none() {
@@ -1070,25 +1098,20 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>) {
     kill_stale_mpv();
     let socket = socket_path();
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(mpv_pid_path());
 
-    let is_flatpak = std::path::Path::new("/.flatpak-info").exists();
-    let mut cmd = if is_flatpak {
-        let mut c = Command::new("flatpak-spawn");
-        c.args(["--host", "mpv"]);
-        c.env_remove("PULSE_SERVER");
-        c.env_remove("PULSE_CLIENTCONFIG");
-        c.env_remove("ALSA_CONFIG_DIR");
-        c.env_remove("ALSA_CONFIG_PATH");
-        c.env_remove("LD_LIBRARY_PATH");
-        c
-    } else {
-        Command::new("mpv")
-    };
+    let mut cmd = Command::new("mpv");
+    cmd.env_remove("LD_LIBRARY_PATH");
+    cmd.env_remove("APPDIR");
 
-    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let cache_dir = format!("{}/.cache/meduza-music", home_dir);
-    let _ = std::fs::create_dir_all(&cache_dir);
-    let log_file_arg = format!("--log-file={}/mpv.log", cache_dir);
+    // Place the log in the private cache dir, restricted to the owner. The log
+    // can contain signed CDN stream URLs, so it is also truncated each start
+    // and mpv is told to log at warn level only.
+    let log_dir = settings::app_cache_root();
+    settings::ensure_private_dir(&log_dir);
+    let log_file_path = log_dir.join("mpv.log");
+    let _ = std::fs::remove_file(&log_file_path);
+    let log_file_arg = format!("--log-file={}", log_file_path.display());
 
     let child = match cmd
         .args([
@@ -1097,18 +1120,22 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>) {
             "--keep-open=yes",
             "--terminal=no",
             "--no-input-default-bindings",
-            &format!("--input-ipc-server={}", socket),
+            &format!("--input-ipc-server={}", socket.display()),
             "--gapless-audio=yes",
-            "--cache=yes",
-            "--cache-pause=no",
-            "--stream-buffer-size=128KiB",
+            "--cache=yes", {
+                // Low-end profile: pause on rebuffer rather than glitch hard,
+                // smaller stream/readahead buffers to trim mpv RAM/IO.
+                if small_buffer { "--cache-pause=yes" } else { "--cache-pause=no" }
+            },
+            if small_buffer { "--stream-buffer-size=64KiB" } else { "--stream-buffer-size=128KiB" },
             "--demuxer-lavf-o=probesize=32768,analyzeduration=0",
             // IMP-3: Tuned for low-latency CDN streaming
-            "--demuxer-readahead-secs=10",
-            "--audio-buffer=0.25",           // Increased to 250ms to prevent audio crackling (buffer underruns)
+            if small_buffer { "--demuxer-readahead-secs=6" } else { "--demuxer-readahead-secs=10" },
+            if small_buffer { "--audio-buffer=0.75" } else { "--audio-buffer=0.25" }, // buffering vs crackle
             "--network-timeout=4",
             "--ytdl=no",                     // We handle URL resolution; disable mpv's own yt-dlp
             "--hr-seek=no",
+            "--msg-level=all=warn",
             &log_file_arg,
         ])
         .stdin(Stdio::null())
@@ -1124,21 +1151,28 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>) {
         }
     };
 
+    let pid = child.id();
     *proc = Some(child);
+    let _ = settings::write_private(&mpv_pid_path(), &pid.to_string());
 
     // Wait for socket file to appear (max 3 s)
     let mut success = false;
     for _ in 0..30 {
         thread::sleep(Duration::from_millis(100));
-        if std::path::Path::new(&socket).exists() {
+        if socket.exists() {
             success = true;
             break;
         }
     }
     if success {
-        println!("[Playback] mpv IPC ready at {}", socket);
+        // SECURITY: restrict the socket to the owner (0600) so other local
+        // users cannot connect and drive mpv (RCE via mpv `run` command).
+        let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
+        // mpv.log contains full CDN stream URLs (signed tokens) — owner-only.
+        let _ = std::fs::set_permissions(&log_file_path, std::fs::Permissions::from_mode(0o600));
+        println!("[Playback] mpv IPC ready at {}", socket.display());
     } else {
-        eprintln!("[Playback] WARNING: mpv socket not found at {} after 3s", socket);
+        eprintln!("[Playback] WARNING: mpv socket not found at {} after 3s", socket.display());
     }
 }
 
@@ -1149,6 +1183,7 @@ impl Drop for PlaybackManager {
             let _ = c.wait();
         }
         let _ = std::fs::remove_file(socket_path());
+        let _ = std::fs::remove_file(mpv_pid_path());
         // IMP-6: Persist resolved CDN URLs to disk so next session is instant
         StreamResolver::save_cache_to_disk();
     }

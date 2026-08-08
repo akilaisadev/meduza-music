@@ -23,6 +23,8 @@ repo/
 *.deb
 *.rpm
 *.tar.gz
+/AppDir/
+*.AppImage
 
 # Flutter / Dart dead code remnants
 .dart_tool/
@@ -35,3 +37,4 @@ repo/
 __pycache__/
 *.pyc
 linuxdeploy-x86_64.AppImage
+.AppImage
