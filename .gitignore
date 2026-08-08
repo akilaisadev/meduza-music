@@ -34,3 +34,4 @@ repo/
 # Python Cache
 __pycache__/
 *.pyc
+linuxdeploy-x86_64.AppImage
