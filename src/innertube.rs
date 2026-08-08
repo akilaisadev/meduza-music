@@ -279,9 +279,6 @@ impl InnerTubeClient {
             }
         }
 
-        if sections.is_empty() {
-            let _ = std::fs::write("/tmp/meduza_home_debug.json", serde_json::to_string_pretty(data).unwrap_or_default());
-        }
         sections
     }
 

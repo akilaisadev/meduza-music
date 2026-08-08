@@ -108,7 +108,7 @@ fn io_pool() -> &'static WorkerPool {
 /// big download can never block a stream resolve.
 fn download_pool() -> &'static WorkerPool {
     static DL: OnceLock<WorkerPool> = OnceLock::new();
-    DL.get_or_init(|| WorkerPool::new("dl", 2, 512))
+    DL.get_or_init(|| WorkerPool::new("dl", 4, 512))
 }
 
 /// CPU-heavy decodes (image decode → RGBA, dominant-color extraction).

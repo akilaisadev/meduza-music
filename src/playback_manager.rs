@@ -125,7 +125,7 @@ impl PlaybackManager {
         let playback_seq    = Arc::new(AtomicU64::new(0));
         let is_paused_flag  = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        // ── Background IPC poller (runs every 100 ms, handles gapless transitions & auto-advance) ──
+        // ── Background IPC poller (runs every 100 ms, handles gapless transitions & track-ended signalling) ──
         let state_bg    = Arc::clone(&state);
         let progress_bg = Arc::clone(&progress);
         let duration_bg = Arc::clone(&duration);
@@ -135,11 +135,8 @@ impl PlaybackManager {
         let idx_bg      = Arc::clone(&queue_index);
         let cache_bg    = Arc::clone(&stream_cache);
         let shuf_bg     = Arc::clone(&is_shuffle);
-        let rep_bg      = Arc::clone(&repeat_mode);
         let ds_bg       = Arc::clone(&data_saver);
         let settings_bg = Arc::clone(&settings);
-        let mpv_bg      = Arc::clone(&mpv_proc);
-        let vol_bg      = Arc::clone(&volume);
         let inner_bg    = Arc::clone(&innertube);
         let paused_bg   = Arc::clone(&is_paused_flag);
         let seq_bg      = Arc::clone(&playback_seq);
@@ -248,33 +245,16 @@ impl PlaybackManager {
                     }
                 }
 
-                // 3. Fallback direct auto-advance when mpv hits EOF
-                // BUG-02: Skip if gapless already handled this cycle
+                // 3. Track EOF → set flag; handle_auto_advance() in the UI thread
+                // is the SINGLE place that acts on this flag. Calling advance from
+                // here as well caused double/triple-advance and state corruption.
                 if !gapless_transitioned {
                     if let Some(eof) = status.eof_reached {
                         if eof {
                             let mut end_flag = lk!(ended_bg);
                             if !*end_flag {
                                 *end_flag = true;
-                                println!("[Playback] Track ended! Auto-advancing to next track...");
-                                Self::execute_bg_auto_advance(
-                                    Arc::clone(&queue_bg),
-                                    Arc::clone(&idx_bg),
-                                    Arc::clone(&shuf_bg),
-                                    Arc::clone(&rep_bg),
-                                    Arc::clone(&curr_bg),
-                                    Arc::clone(&state_bg),
-                                    Arc::clone(&cache_bg),
-                                    Arc::clone(&ds_bg),
-                                    Arc::clone(&settings_bg),
-                                    Arc::clone(&duration_bg),
-                                    Arc::clone(&progress_bg),
-                                    Arc::clone(&ended_bg),
-                                    Arc::clone(&mpv_bg),
-                                    Arc::clone(&vol_bg),
-                                    Arc::clone(&inner_bg),
-                                    Arc::clone(&seq_bg),
-                                );
+                                println!("[Playback] Track ended (IPC eof-reached), signalling handle_auto_advance.");
                             }
                         }
                     }
@@ -423,31 +403,37 @@ impl PlaybackManager {
             }
         });
 
-        // Immediately trigger background preloader (waits until Playing state)
-        self.trigger_background_preloader(track.clone());
+        // Only trigger preloader for real tracks (not playlist markers)
+        if !track.media_id.starts_with("PL:") {
+            // Immediately trigger background preloader (waits until Playing state)
+            self.trigger_background_preloader(track.clone());
 
-        // IMP-1: Fetch radio queue in background, guarded by playback_seq,
-        // then speculatively warm the URL cache for the next 2 tracks.
-        let innertube_c = Arc::clone(&self.innertube);
-        let queue_c     = Arc::clone(&self.queue);
-        let track_c     = track.clone();
-        let seq_c2      = Arc::clone(&self.playback_seq);
-        let seq_val     = seq;
-        let quality_w   = lk!(self.settings).audio_quality;
+            // IMP-1: Fetch radio queue in background, guarded by playback_seq,
+            // then speculatively warm the URL cache for the next 2 tracks.
+            let innertube_c = Arc::clone(&self.innertube);
+            let queue_c     = Arc::clone(&self.queue);
+            let track_c     = track.clone();
+            let seq_c2      = Arc::clone(&self.playback_seq);
+            let seq_val     = seq;
+            let quality_w   = lk!(self.settings).audio_quality;
 
-        crate::workers::download().submit(move || {
-            if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
-            let radio = crate::workers::block_on(innertube_c.fetch_next_radio(&track_c.media_id));
-            if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
-            // Warm next 2 URLs before populating queue so skips are instant
-            let warm_ids: Vec<String> = radio.iter().take(2).map(|t| t.media_id.clone()).collect();
-            let mut q = lk!(queue_c);
-            q.clear();
-            q.push(QueueItem { track: track_c });
-            for t in radio { q.push(QueueItem { track: t }); }
-            drop(q);
-            Self::warm_url_cache_in_bg(warm_ids, quality_w);
-        });
+            crate::workers::download().submit(move || {
+                if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
+                let radio = crate::workers::block_on(innertube_c.fetch_next_radio(&track_c.media_id));
+                if seq_c2.load(Ordering::SeqCst) != seq_val { return; }
+                // Warm next 2 URLs before populating queue so skips are instant
+                let warm_ids: Vec<String> = radio.iter().take(2).map(|t| t.media_id.clone()).collect();
+                let mut q = lk!(queue_c);
+                q.clear();
+                q.push(QueueItem { track: track_c });
+                for t in radio { q.push(QueueItem { track: t }); }
+                drop(q);
+                Self::warm_url_cache_in_bg(warm_ids, quality_w);
+            });
+        }
+        // For playlists: queue and current_track are set in the io thread after
+        // fetching playlist tracks. The preloader will be triggered after the
+        // io thread resolves the actual first track.
     }
 
     pub fn toggle_pause(&self) {
@@ -646,6 +632,8 @@ impl PlaybackManager {
         current_track: TrackItem,
     ) {
         let vid_c = current_track.media_id.clone();
+        // Use download pool (long-running sleeps) — io pool is for short latency work.
+        // We keep the preloader on download to avoid starving URL resolves on the io pool.
         crate::workers::download().submit(move || {
             let (quality, is_data_saver) = {
                 let s = lk!(settings_c);
@@ -988,28 +976,45 @@ impl PlaybackManager {
     }
 
     /// Check & reset the track-ended flag (called from UI thread, no IPC).
+    /// This is now the SINGLE authority for auto-advancing tracks.
     pub fn handle_auto_advance(&self) {
-        // Guard: don't advance if not in a playing/paused state
-        let st = lk!(self.state).clone();
-        if !matches!(st, PlaybackState::Playing | PlaybackState::Paused) {
-            return;
-        }
-
+        // Guard: only act on ended flag, regardless of state
         let ended = *lk!(self.track_ended);
         if !ended { return; }
 
-        // Reset flag atomically before spawning next track
+        // Reset flag before spawning next track to prevent double-advance
         *lk!(self.track_ended) = false;
 
         let rep = *lk!(self.repeat_mode);
         match rep {
             RepeatMode::One => {
                 if let Some(t) = lk!(self.current_track).clone() {
-                    self.play_now(t);
+                    println!("[Playback] Repeat-One: replaying '{}'", t.title);
+                    self.play_now_without_queue_reset(t);
                 }
             }
             _ => {
-                self.skip_next();
+                let queue = lk!(self.queue).clone();
+                if queue.is_empty() { return; }
+                // Use execute_bg_auto_advance so preloaded URLs are used
+                Self::execute_bg_auto_advance(
+                    Arc::clone(&self.queue),
+                    Arc::clone(&self.queue_index),
+                    Arc::clone(&self.is_shuffle),
+                    Arc::clone(&self.repeat_mode),
+                    Arc::clone(&self.current_track),
+                    Arc::clone(&self.state),
+                    Arc::clone(&self.stream_cache),
+                    Arc::clone(&self.data_saver),
+                    Arc::clone(&self.settings),
+                    Arc::clone(&self.duration_secs),
+                    Arc::clone(&self.progress_secs),
+                    Arc::clone(&self.track_ended),
+                    Arc::clone(&self.mpv_process),
+                    Arc::clone(&self.volume),
+                    Arc::clone(&self.innertube),
+                    Arc::clone(&self.playback_seq),
+                );
             }
         }
     }
