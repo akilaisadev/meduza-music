@@ -3,7 +3,7 @@ set -e
 
 APP_NAME="MeduzaMusic"
 EXEC_NAME="meduza-music"
-VERSION="1.0.0"
+VERSION="1.2.0"
 
 echo "Building AppImage for $APP_NAME v$VERSION..."
 
