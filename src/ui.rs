@@ -674,7 +674,10 @@ impl MeduzaApp {
         if self.home_dirty.swap(false, std::sync::atomic::Ordering::SeqCst) || self.home_snapshot.is_empty() {
             self.home_snapshot = self.sections.lock().unwrap().clone();
         }
-        let sections = std::mem::take(&mut self.home_snapshot);
+        // NOTE: Do NOT mem::take here — that empties home_snapshot every frame,
+        // forcing a full re-clone from the mutex on the very next frame (was causing
+        // the settings/sections mutex lock storm that froze the UI thread).
+        let sections = self.home_snapshot.clone();
         let mut seen = std::collections::HashSet::<String>::new();
 
         let heavy_rot_raw = self.playback.recommendation_engine.lock().unwrap().get_heavy_rotation(8);
@@ -757,14 +760,13 @@ impl MeduzaApp {
             return;
         }
 
+        let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
             .id_source("home")
             .show(ui, |ui| {
                 ui.add_space(8.0);
-
-                // All shelves (Personalized & Generic) are now synthesized into `sections` during network fetch.
 
                 // 5. InnerTube Discovery Feed Sections (Deduplicated)
                 for section in &sections {
@@ -777,7 +779,7 @@ impl MeduzaApp {
                                 .strong(),
                         );
                         ui.add_space(10.0);
-                        self.card_grid(ui, &unique_items);
+                        self.card_grid(ui, &unique_items, max_dim);
                         ui.add_space(26.0);
                     }
                 }
@@ -791,14 +793,13 @@ impl MeduzaApp {
         ).fill(ACCENT).rounding(Rounding::same(20.0))).clicked()
     }
 
-    fn card_grid(&mut self, ui: &mut egui::Ui, tracks: &[TrackItem]) {
+    fn card_grid(&mut self, ui: &mut egui::Ui, tracks: &[TrackItem], max_dim: u32) {
         // Dynamically compute how many cards fit per row with scrollbar margin
         let available_w = (ui.available_width() - 16.0).max(100.0);
         let card_w = 156.0_f32;
         let gap    = 16.0_f32;
         let cols   = ((available_w + gap) / (card_w + gap)).floor().max(1.0) as usize;
 
-        let tracks: Vec<TrackItem> = tracks.to_vec();
         let row_count = (tracks.len() + cols - 1) / cols;
 
         for row in 0..row_count {
@@ -808,7 +809,7 @@ impl MeduzaApp {
 
             ui.horizontal(|ui| {
                 for track in row_tracks {
-                    self.draw_card(ui, track, card_w);
+                    self.draw_card(ui, track, card_w, max_dim);
                     ui.add_space(gap);
                 }
             });
@@ -816,7 +817,7 @@ impl MeduzaApp {
         }
     }
 
-    fn draw_card(&mut self, ui: &mut egui::Ui, track: &TrackItem, card_w: f32) {
+    fn draw_card(&mut self, ui: &mut egui::Ui, track: &TrackItem, card_w: f32, max_dim: u32) {
         let pad       = 10.0_f32;
         let img_size  = card_w - pad * 2.0;
         let card_h    = img_size + 64.0;
@@ -842,7 +843,6 @@ impl MeduzaApp {
 
         // Album art
         let pending = Arc::clone(&self.img_pending);
-        let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
         if let Some(tex) = Self::get_texture(
             &mut self.img_cache, &pending, &self.image_rgba, ui.ctx(),
             &track.media_id, &track.thumbnail_url, max_dim,
@@ -1056,6 +1056,8 @@ impl MeduzaApp {
 
     fn track_list(&mut self, ui: &mut egui::Ui, tracks: &[TrackItem]) {
         let cur = self.playback.current_track.lock().unwrap().clone();
+        // Read max_dim ONCE per frame, not once per track — avoids locking settings mutex N times per frame
+        let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
         for (i, track) in tracks.iter().enumerate() {
             let is_cur = cur.as_ref().map(|c| c.media_id == track.media_id).unwrap_or(false);
             let (rect, resp) = ui.allocate_exact_size(
@@ -1080,7 +1082,6 @@ impl MeduzaApp {
             let tr = egui::Rect::from_center_size(
                 egui::pos2(rect.min.x + p + 34.0, rect.center().y), Vec2::splat(42.0));
             let pending = Arc::clone(&self.img_pending);
-            let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
             if let Some(tex) = Self::get_texture(&mut self.img_cache, &pending, &self.image_rgba, ui.ctx(),
                 &track.media_id, &track.thumbnail_url, max_dim)
             {
@@ -1157,6 +1158,8 @@ impl MeduzaApp {
         let ratio = (pos / dur).clamp(0.0, 1.0);
         let track = self.playback.current_track.lock().unwrap().clone();
         let state = self.playback.state.lock().unwrap().clone();
+        // Read max_dim once here (not inside the art rendering block) to avoid locking settings inside a closure
+        let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
 
         // ── 1. Interactive Green Progress Bar at top edge of player ───────────
         let w = full_rect.width();
@@ -1209,7 +1212,6 @@ impl MeduzaApp {
 
                 let tex_opt = if let Some(ref t) = track {
                     let p = Arc::clone(&self.img_pending);
-                    let max_dim = self.playback.settings.lock().unwrap_or_else(|e| e.into_inner()).image_max_dim();
                     Self::get_texture(&mut self.img_cache, &p, &self.image_rgba, ui.ctx(), &t.media_id, &t.thumbnail_url, max_dim)
                 } else { None };
 
