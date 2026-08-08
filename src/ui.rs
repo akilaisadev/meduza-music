@@ -1542,7 +1542,7 @@ impl MeduzaApp {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Meduza Music Player").color(T_PRI).font(FontId::proportional(18.0)).strong());
                                     ui.add_space(8.0);
-                                    ui.label(RichText::new("v1.0.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
+                                    ui.label(RichText::new("v1.2.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
                                 });
 
                                 ui.add_space(4.0);
