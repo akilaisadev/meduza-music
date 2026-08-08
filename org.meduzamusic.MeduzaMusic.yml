@@ -1,0 +1,45 @@
+app-id: org.meduzamusic.MeduzaMusic
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: meduza-music
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --socket=pulseaudio
+  - --talk-name=org.freedesktop.Notifications
+build-options:
+  build-args:
+    - --share=network
+  env:
+    CARGO_HOME: /run/build/meduza-music/cargo
+modules:
+  - name: yt-dlp
+    buildsystem: simple
+    build-commands:
+      - wget https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -O yt-dlp
+      - install -D -m 755 yt-dlp /app/bin/yt-dlp
+  - name: mpv
+    buildsystem: simple
+    build-commands:
+      # Use an AppImage or static build of mpv for simplicity in this local flatpak
+      - wget https://github.com/stps/mpv-appimage/releases/download/v0.38.0/mpv-0.38.0-x86_64.AppImage -O mpv
+      - install -D -m 755 mpv /app/bin/mpv
+  - name: rust-extension
+    buildsystem: simple
+    build-commands:
+      # Install Rust toolchain
+      - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+  - name: meduza-music
+    buildsystem: simple
+    build-commands:
+      - export PATH="$HOME/.cargo/bin:$PATH" && cargo build --release
+      - install -D -m 755 target/release/meduza-music /app/bin/meduza-music
+      - install -D -m 644 org.meduzamusic.MeduzaMusic.desktop /app/share/applications/org.meduzamusic.MeduzaMusic.desktop
+      - install -D -m 644 logo.png /app/share/icons/hicolor/512x512/apps/org.meduzamusic.MeduzaMusic.png
+    sources:
+      - type: dir
+        path: .
