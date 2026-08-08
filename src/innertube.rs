@@ -193,8 +193,22 @@ impl InnerTubeClient {
 
     /// Parse a musicTwoRowItemRenderer (used in carousel/grid)
     fn parse_two_row(r: &serde_json::Value) -> Option<TrackItem> {
-        let vid = Self::video_id(r)?;
-        if vid.len() != 11 { return None; }
+        let mut vid = Self::video_id(r).unwrap_or_default();
+        if vid.len() != 11 {
+            if let Some(nav) = r.get("navigationEndpoint") {
+                if let Some(be) = nav.get("browseEndpoint") {
+                    if let Some(bid) = be["browseId"].as_str() {
+                        if bid.starts_with("VL") {
+                            vid = format!("PL:{}", &bid[2..]);
+                        } else {
+                            vid = format!("PL:{}", bid);
+                        }
+                    }
+                }
+            }
+        }
+        if vid.is_empty() { return None; }
+        
         let title = Self::text_run(&r["title"]["runs"]);
         if title.is_empty() { return None; }
         let artist = Self::text_run(&r["subtitle"]["runs"]);
@@ -205,7 +219,7 @@ impl InnerTubeClient {
             return None;
         }
 
-        let thumbnail_url = Self::thumbnail(r, &vid);
+        let thumbnail_url = Self::thumbnail(r, &vid.replace("PL:", ""));
         Some(TrackItem { title, artist, media_id: vid, thumbnail_url, duration_seconds: 0 })
     }
 
@@ -263,6 +277,10 @@ impl InnerTubeClient {
                     sections.push(BrowseSection { title: "New Releases".to_string(), items });
                 }
             }
+        }
+
+        if sections.is_empty() {
+            let _ = std::fs::write("/tmp/meduza_home_debug.json", serde_json::to_string_pretty(data).unwrap_or_default());
         }
         sections
     }
@@ -410,11 +428,16 @@ impl InnerTubeClient {
         results
     }
 
-    /// Fetch radio/autoplay queue for a given video (uses YouTube Music RDAMVM radio playlist).
-    pub async fn fetch_next_radio(&self, video_id: &str) -> Vec<TrackItem> {
-        let radio_id = format!("RDAMVM{}", video_id);
+    /// Fetch radio/autoplay queue for a given video, or playlist tracks if media_id starts with PL:
+    pub async fn fetch_next_radio(&self, media_id: &str) -> Vec<TrackItem> {
+        let playlist_id = if media_id.starts_with("PL:") {
+            media_id.strip_prefix("PL:").unwrap_or("").to_string()
+        } else {
+            format!("RDAMVM{}", media_id)
+        };
+
         let body = json!({
-            "playlistId": radio_id,
+            "playlistId": playlist_id,
             "isAudioOnly": true,
             "context": self.ctx()
         });
@@ -435,7 +458,7 @@ impl InnerTubeClient {
             for item in arr {
                 if let Some(r) = item.get("playlistPanelVideoRenderer") {
                     let vid = r["videoId"].as_str().unwrap_or("");
-                    if vid.len() != 11 || vid == video_id { continue; }
+                    if vid.len() != 11 || vid == media_id { continue; }
                     let title = Self::text_run(&r["title"]["runs"]);
                     let artist = Self::text_run(&r["longBylineText"]["runs"]);
                     let dur_str = r["lengthText"]["simpleText"].as_str().unwrap_or("");
@@ -451,11 +474,11 @@ impl InnerTubeClient {
         }
 
         if tracks.is_empty() {
-            println!("[InnerTube] Radio fallback search for {}", video_id);
+            println!("[InnerTube] Radio fallback search for {}", media_id);
             tracks = self.search_tracks("Top Music Hits Mix").await;
         }
 
-        println!("[InnerTube] radio({}) → {} tracks", video_id, tracks.len());
+        println!("[InnerTube] radio({}) → {} tracks", media_id, tracks.len());
         tracks
     }
 

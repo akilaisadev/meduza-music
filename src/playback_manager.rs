@@ -340,19 +340,53 @@ impl PlaybackManager {
         let reco_c       = Arc::clone(&self.recommendation_engine);
         let track_cl     = track.clone();
         let settings_c   = Arc::clone(&self.settings);
+        let inner_c      = Arc::clone(&self.innertube);
+        let queue_c_io   = Arc::clone(&self.queue);
+        let current_track_c = Arc::clone(&self.current_track);
+        let duration_c   = Arc::clone(&self.duration_secs);
 
-crate::workers::io().submit(move || {
+        crate::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
+
+            let mut vid = video_id.clone();
+            let mut play_title = title.clone();
+            let mut track_to_reco = track_cl.clone();
+
+            // If it's a playlist, fetch its tracks and play the first one!
+            if vid.starts_with("PL:") {
+                println!("[Playback] Resolving playlist: {}", play_title);
+                let playlist_tracks = crate::workers::block_on(inner_c.fetch_next_radio(&vid));
+                if seq_c.load(Ordering::SeqCst) != seq { return; }
+                
+                if playlist_tracks.is_empty() {
+                    *lk!(state_c) = PlaybackState::Error("Playlist is empty or could not be loaded".to_string());
+                    return;
+                }
+                
+                let first_track = playlist_tracks[0].clone();
+                vid = first_track.media_id.clone();
+                play_title = first_track.title.clone();
+                track_to_reco = first_track.clone();
+
+                *lk!(current_track_c) = Some(first_track.clone());
+                *lk!(duration_c) = first_track.duration_seconds as f32;
+                
+                let mut q = lk!(queue_c_io);
+                q.clear();
+                for t in playlist_tracks {
+                    q.push(QueueItem { track: t });
+                }
+            }
 
             ensure_mpv_running(&mpv_proc, lk!(settings_c).mpv_small_buffer());
 
             // Record user taste activity
-            lk!(reco_c).record_play(track_cl);
+            lk!(reco_c).record_play(track_to_reco.clone());
 
             // Check DataSaver local disk cache (0-data instant replay!)
-            if let Some(cached_path) = lk!(data_saver_c).get_cached_file(&video_id) {
+            if let Some(cached_path) = lk!(data_saver_c).get_cached_file(&vid) {
                 if seq_c.load(Ordering::SeqCst) != seq { return; }
-                println!("[DataSaver] ZERO-DATA INSTANT PLAYBACK FROM DISK: '{}' ({})", title, cached_path);
+                println!("[DataSaver] ZERO-DATA INSTANT PLAYBACK FROM DISK: '{}' ({})", play_title, cached_path);
                 ipc_send(serde_json::json!({"command": ["loadfile", cached_path, "replace"]}));
                 ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
                 ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
@@ -360,8 +394,8 @@ crate::workers::io().submit(move || {
                 return;
             }
 
-            println!("[Playback] Resolving stream for '{}' ({})", title, video_id);
-            let Some(url) = StreamResolver::get_audio_url(&video_id, quality) else {
+            println!("[Playback] Resolving stream for '{}' ({})", play_title, vid);
+            let Some(url) = StreamResolver::get_audio_url(&vid, quality) else {
                 if seq_c.load(Ordering::SeqCst) == seq {
                     *lk!(state_c) = PlaybackState::Error("yt-dlp: could not resolve stream URL".to_string());
                 }
@@ -369,7 +403,7 @@ crate::workers::io().submit(move || {
             };
 
             if seq_c.load(Ordering::SeqCst) != seq {
-                println!("[Playback] Discarding stale resolved stream for '{}'", title);
+                println!("[Playback] Discarding stale resolved stream for '{}'", play_title);
                 return;
             }
 
@@ -377,7 +411,7 @@ crate::workers::io().submit(move || {
             ipc_send(serde_json::json!({"command": ["set_property", "volume", volume as f64]}));
             ipc_send(serde_json::json!({"command": ["set_property", "pause", false]}));
             *lk!(state_c) = PlaybackState::Playing;
-            println!("[Playback] Streaming: '{}' ({})", title, video_id);
+            println!("[Playback] Streaming: '{}' ({})", play_title, vid);
 
             // Cache stream to disk in background if enabled in settings
             let (enable_cache, max_cap, pace) = {
@@ -385,7 +419,7 @@ crate::workers::io().submit(move || {
                 (s.enable_cache, s.max_cache_size_mb, s.pace_downloads())
             };
             if enable_cache {
-                lk!(data_saver_c).cache_stream_in_bg(video_id, url, max_cap, pace);
+                lk!(data_saver_c).cache_stream_in_bg(vid, url, max_cap, pace);
             }
         });
 
