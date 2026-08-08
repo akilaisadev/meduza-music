@@ -35,7 +35,7 @@ impl JobQueue {
             return false; // pool is slammed — drop the work rather than queue it
         }
         q.push_back(job);
-        self.cv.notify_one();
+        self.cv.notify_all();
         true
     }
 
@@ -43,6 +43,7 @@ impl JobQueue {
         let mut q = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(job) = q.pop_front() {
+                self.cv.notify_all();
                 return job;
             }
             q = self.cv.wait(q).unwrap_or_else(|e| e.into_inner());
@@ -57,17 +58,24 @@ pub struct WorkerPool {
 }
 
 impl WorkerPool {
-    /// Spawn `threads` workers with small stacks (256 KiB) to reduce resident
-    /// memory on low-end machines.
-    pub fn new(name: &'static str, threads: usize) -> Self {
-        let queue = Arc::new(JobQueue::new(threads * 4));
+    /// Spawn `threads` workers. Stack sizes are modest to keep resident memory
+    /// low on low-end machines; the decode pool uses a bigger stack because
+    /// image decoders (esp. WebP) can be deep-stack recursive.
+    pub fn new(name: &'static str, threads: usize, stack_kib: usize) -> Self {
+        // Generous queue headroom (threads * 8): play/advance/warmup jobs are
+        // then never dropped in practice, while a slammed pool still sheds
+        // work instead of unbounded-queuing stale jobs. Deliberately NOT a
+        // blocking API — a blocking enqueue from the UI or poller thread would
+        // stall behind long io jobs (e.g. URL warm-ups) and playback/app would
+        // appear frozen.
+        let queue = Arc::new(JobQueue::new(threads * 8));
         let mut handles = Vec::with_capacity(threads);
         for _ in 0..threads {
             let q = Arc::clone(&queue);
             handles.push(
                 std::thread::Builder::new()
                     .name(format!("meduza-{name}"))
-                    .stack_size(256 * 1024)
+                    .stack_size(stack_kib * 1024)
                     .spawn(move || loop {
                         let job = q.pop();
                         job();
@@ -92,7 +100,7 @@ impl WorkerPool {
 /// stream-URL warm-ups, resolve+play, auto-advance.
 fn io_pool() -> &'static WorkerPool {
     static IO: OnceLock<WorkerPool> = OnceLock::new();
-    IO.get_or_init(|| WorkerPool::new("io", 4))
+    IO.get_or_init(|| WorkerPool::new("io", 4, 512))
 }
 
 /// Long-running background work that holds a thread for a long time: data
@@ -100,13 +108,14 @@ fn io_pool() -> &'static WorkerPool {
 /// big download can never block a stream resolve.
 fn download_pool() -> &'static WorkerPool {
     static DL: OnceLock<WorkerPool> = OnceLock::new();
-    DL.get_or_init(|| WorkerPool::new("dl", 2))
+    DL.get_or_init(|| WorkerPool::new("dl", 2, 512))
 }
 
 /// CPU-heavy decodes (image decode → RGBA, dominant-color extraction).
+/// Larger stack: image decoders (notably WebP) recurse deeply.
 fn decode_pool() -> &'static WorkerPool {
     static DECODE: OnceLock<WorkerPool> = OnceLock::new();
-    DECODE.get_or_init(|| WorkerPool::new("decode", 1))
+    DECODE.get_or_init(|| WorkerPool::new("decode", 1, 1024))
 }
 
 pub fn io() -> &'static WorkerPool { io_pool() }

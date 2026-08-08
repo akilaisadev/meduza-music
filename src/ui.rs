@@ -315,6 +315,7 @@ impl MeduzaApp {
         pending: &Arc<Mutex<HashMap<String, Option<Vec<u8>>>>>,
         rgba: &Arc<Mutex<HashMap<String, (usize, usize, Vec<u8>)>>>,
         max_dim: u32,
+        ctx: egui::Context,
     ) {
         // SSRF defense: only fetch images from known YouTube/Google hosts.
         if !crate::settings::host_is_allowed(url, crate::settings::UrlKind::Image) {
@@ -399,6 +400,9 @@ impl MeduzaApp {
                     g.insert(id2, Some(bytes));
                     if g.len() > 96 { g.clear(); } // bound raw-bytes memory
                 }
+                // One-shot wake so this freshly decoded image is drawn promptly
+                // (thumbnails appear within ~1 frame; no sustained repaint loop).
+                ctx.request_repaint();
             } else {
                 // Mark as finished-but-empty so the UI never re-queues this id
                 // every frame (that was a repo-wide refresh storm on failures).
@@ -481,7 +485,7 @@ impl MeduzaApp {
         {
             let ready = pending.lock().unwrap().get(id).is_some();
             if !ready {
-                Self::queue_image(id, url, pending, rgba, max_dim);
+                Self::queue_image(id, url, pending, rgba, max_dim, ctx.clone());
             }
         }
         None
@@ -2343,12 +2347,9 @@ impl eframe::App for MeduzaApp {
             return;
         }
 
-        // Request repaint when a freshly decoded image is ready to upload. The
-        // get_texture() path drains the RGBA map as it uploads, so this idle
-        // burst stops once every visible thumbnail is on the GPU.
-        if self.image_rgba.lock().unwrap().values().any(|(w, _h, _)| *w > 0) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(33));
-        }
+        // NOTE: freshly decoded images wake the frame loop themselves via
+        // `ctx.request_repaint()` from the (single) decode worker — one wake
+        // per image, never a sustained repaint loop.
 
         // ── Layout ───────────────────────────────────────────────────────────
         egui::TopBottomPanel::bottom("player")

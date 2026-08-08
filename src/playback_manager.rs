@@ -1101,6 +1101,8 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: boo
     let _ = std::fs::remove_file(mpv_pid_path());
 
     let mut cmd = Command::new("mpv");
+    cmd.env_remove("LD_LIBRARY_PATH");
+    cmd.env_remove("APPDIR");
 
     // Place the log in the private cache dir, restricted to the owner. The log
     // can contain signed CDN stream URLs, so it is also truncated each start
