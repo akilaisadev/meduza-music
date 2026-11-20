@@ -1468,7 +1468,9 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: boo
             // Ignore user config/scripts: they could redefine key bindings or
             // load Lua that calls mpv's `run` command through our IPC socket.
             "--no-config",
-            "--no-scripts",
+            // `--no-scripts` is not a valid mpv flag (the option is
+            // `--load-scripts`); using it aborts mpv at startup on 0.37.
+            "--load-scripts=no",
             "--input-conf=/dev/null",
             "--no-video",
             "--idle=yes",
