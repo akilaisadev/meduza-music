@@ -9,3 +9,7 @@ meduza-core.workspace = true
 meduza-playback.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Pure-Rust MPRIS2 backend (no GTK/system D-Bus dev headers needed).
+souvlaki = { version = "0.9", default-features = false, features = ["use_zbus"] }

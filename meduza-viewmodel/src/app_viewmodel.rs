@@ -42,6 +42,8 @@ impl AppViewModel {
     pub fn new(runtime: tokio::runtime::Handle) -> Arc<Self> {
         let innertube = Arc::new(InnerTubeClient::new());
         let playback = Arc::new(PlaybackManager::new(Arc::clone(&innertube)));
+        #[cfg(target_os = "linux")]
+        let playback_for_mpris = Arc::clone(&playback);
 
         let vm = Arc::new(Self {
             innertube,
@@ -66,6 +68,14 @@ impl AppViewModel {
 
         // Start background updater thread
         vm.start_background_updater();
+
+        // Expose playback to Linux desktop media keys / MPRIS2 clients.
+        #[cfg(target_os = "linux")]
+        {
+            if crate::mpris::start(playback_for_mpris).is_none() {
+                eprintln!("[MPRIS] D-Bus unavailable; global media keys disabled");
+            }
+        }
 
         vm
     }

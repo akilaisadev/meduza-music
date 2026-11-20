@@ -507,6 +507,22 @@ impl PlaybackManager {
         // io thread resolves the actual first track.
     }
 
+    /// Resume playback from a stopped/idle state without discarding the queue.
+    /// Used by global media keys (MPRIS Play).
+    pub fn play_current_or_next(&self) {
+        let state = lk!(self.state).clone();
+        match state {
+            PlaybackState::Playing => return,
+            PlaybackState::Paused => { self.toggle_pause(); return; }
+            _ => {}
+        }
+        if let Some(track) = lk!(self.current_track).clone() {
+            self.play_now_without_queue_reset(track);
+        } else {
+            self.skip_next();
+        }
+    }
+
     pub fn toggle_pause(&self) {
         let st = lk!(self.state).clone();
         match st {
