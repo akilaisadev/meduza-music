@@ -15,10 +15,17 @@
       <li>Synchronized lyrics from LRCLIB in the full-screen player</li>
       <li>Local playlists with JSON import/export</li>
       <li>MPRIS2 and global media-key support on Linux</li>
-      <li>Modern Spotify-inspired UI with smooth rounding</li>
+      <li>Redesigned UI with a queue drawer, artwork-tinted full-screen player and keyboard shortcuts</li>
       <li>Endless radio queue &amp; shuffle/repeat support</li>
     </ul>
   </description>
   <launchable type="desktop-id">org.meduzamusic.MeduzaMusic.desktop</launchable>
   <content_rating type="oars-1.1" />
+  <releases>
+    <release version="1.4.0" date="2026-11-21">
+      <description>
+        <p>Redesigned user interface, playback and persistence bug fixes, and automated release packages.</p>
+      </description>
+    </release>
+  </releases>
 </component>

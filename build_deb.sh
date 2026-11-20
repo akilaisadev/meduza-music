@@ -16,7 +16,7 @@ OUT="target/deb/${PKG}.deb"
 echo "Building ${PKG} ..."
 
 # 1. Release binary
-cargo build --release --offline
+cargo build --release --locked
 BIN="target/release/meduza-ui"
 command -v strip >/dev/null 2>&1 && strip "$BIN" || true
 

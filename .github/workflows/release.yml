@@ -1,0 +1,138 @@
+name: Release
+
+# Pushing a tag such as v1.4.0 builds every package and publishes a GitHub
+# Release with the artifacts attached.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Check tag matches Cargo version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          TAG="${GITHUB_REF_NAME#v}"
+          if [ "$VERSION" != "$TAG" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION}" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: Test before packaging
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libdbus-1-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libxkbcommon-dev libwayland-dev \
+            mpv nodejs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  deb:
+    name: Debian package
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libdbus-1-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libxkbcommon-dev libwayland-dev curl
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build .deb
+        run: ./build_deb.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/deb/*.deb
+          if-no-files-found: error
+
+  appimage:
+    name: AppImage
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    env:
+      # CI runners have no FUSE; run linuxdeploy's AppImage by extraction.
+      APPIMAGE_EXTRACT_AND_RUN: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libdbus-1-dev libgl1-mesa-dev libx11-dev libxcursor-dev \
+            libxi-dev libxrandr-dev libxkbcommon-dev libwayland-dev wget
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build AppImage
+        run: ./build_appimage.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: "*.AppImage"
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak
+    needs: [verify, test]
+    runs-on: ubuntu-latest
+    container:
+      image: bilelmoussaoui/flatpak-github-actions:freedesktop-24.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: Meduza_Music-${{ needs.verify.outputs.version }}-x86_64.flatpak
+          manifest-path: org.meduzamusic.MeduzaMusic.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+          arch: x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: Meduza_Music-*.flatpak
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [verify, deb, appimage, flatpak]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes for this version
+        run: sed -n '1,/^---$/p' RELEASE_NOTES.md | sed '$d' > notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ls -la dist
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Meduza Music ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md
