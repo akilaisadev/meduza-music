@@ -21,28 +21,19 @@
 
 ## 📸 Interface Showcase
 
-### 🏠 Home Discovery Feed
-Personalized shelves (*Jump back in*, *Heavy rotation*, *Listening history*, *Top Artists & Mixes*) with high-contrast, always-visible scrollbar UI.
+### 🏠 Home
+Quick picks from your recent listening, sideways-scrolling shelves for your personalised feed, and skeleton placeholders while it loads.
 
-![Meduza Music Home Screen](images/home_feed.png)
+![Meduza Music home screen](images/home_redesign.png)
 
-<br />
+### 🎧 Player, Queue & Full-Screen
+A bottom bar with transport, seek and volume, plus a queue drawer you can jump around in. The full-screen player is tinted with the current track's artwork and shows synced lyrics. Click a lyric line to seek to it.
 
-### 💿 Full-Screen Player & Search
-Cinematic full-screen player with spinning vinyl record disc animation, alongside instant category browsing.
+### 🔍 Search & 📚 Library
+A large search field with live suggestions, a top result card and genre browsing. The library has a playlists grid, a liked-songs page and a playlist view with rename, delete, and JSON import/export.
 
-| 🎵 Cinematic Player | 🔍 Instant Category Search |
-|---|---|
-| ![Full Screen Player](images/now_playing.png) | ![Search Categories Grid](images/search_categories.png) |
-
-<br />
-
-### ⚙️ Settings Control Center & 💚 Library
-Toggle low-end hardware mode, gapless preload depth, offline caching, and manage your saved library and playlists.
-
-| ⚙️ Performance & Settings | 💚 Your Library |
-|---|---|
-| ![Settings Control Center](images/settings_control_center.png) | ![Your Library View](images/library.png) |
+### ⌨️ Keyboard & Right-Click
+`Space` play/pause, `Ctrl+←` / `Ctrl+→` previous/next, `←` / `→` seek 5 s, `Ctrl+K` search, `Esc` close the full-screen player or queue, `Ctrl+0` reset zoom. Right-click any track for play next, add to queue, like, or add to a playlist.
 
 ---
 
@@ -53,7 +44,7 @@ Toggle low-end hardware mode, gapless preload depth, offline caching, and manage
 - 🏠 **Smart Home Feed**: Dynamically adapts to your top artists and genres with instant offline session caching.
 - 🔊 **Low-Latency MPV Player**: Resolves upcoming stream URLs in the background for smooth gapless transitions (buffer size configurable via Low-End mode).
 - 💾 **Offline Data Saver**: Option to cache played audio locally for replay without network access.
-- 🎨 **Glassmorphic Modern UI**: Dark mode UI with custom visual scrollbars, album art caching, and audio spectrum vinyl animations.
+- 🎨 **Modern Dark UI**: Layered surfaces, vector icons that render the same on every system, artwork-driven accent colours, and toast notifications for playback errors and playlist actions.
 - 📝 **Synchronized Lyrics**: Fetch time-synced lyrics from LRCLIB in the full-screen player.
 - 📚 **Local Playlists**: Build custom playlists, with JSON import/export.
 - 🎹 **Global Media Keys**: MPRIS2 integration for desktop media controls and metadata (Linux).
