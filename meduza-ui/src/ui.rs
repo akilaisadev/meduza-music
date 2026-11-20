@@ -1,6 +1,8 @@
 use eframe::egui::{self, Color32, FontId, RichText, Sense, Stroke, Vec2, Rounding};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use meduza_core::innertube::TrackItem;
 use meduza_playback::playback_manager::PlaybackState;
@@ -31,6 +33,10 @@ pub struct MeduzaApp {
     last_search:    String,
     suggestions:    Arc<Mutex<Vec<String>>>,
     show_suggest:   bool,
+    /// Debounce + stale-response guard for search suggestions.
+    pending_suggest:  Option<String>,
+    suggest_changed_at: Instant,
+    suggest_gen:      Arc<AtomicU64>,
 
     // Images
     img_cache:    HashMap<String, egui::TextureHandle>,
@@ -45,6 +51,10 @@ pub struct MeduzaApp {
     cached_sections:   Vec<meduza_core::innertube::BrowseSection>,
     cached_search:     Vec<TrackItem>,
     cached_max_dim:    u32,
+
+    // Settings screen cache (directory scan is expensive)
+    cache_size_mb:        f32,
+    cache_size_checked_at: Instant,
 }
 
 impl MeduzaApp {
@@ -136,6 +146,9 @@ impl MeduzaApp {
             last_search:  String::new(),
             suggestions:    Arc::new(Mutex::new(Vec::new())),
             show_suggest:   false,
+            pending_suggest: None,
+            suggest_changed_at: Instant::now(),
+            suggest_gen: Arc::new(AtomicU64::new(0)),
             img_cache:       HashMap::new(),
             img_pending:     Arc::new(Mutex::new(HashMap::new())),
             image_rgba:      Arc::new(Mutex::new(HashMap::new())),
@@ -145,6 +158,8 @@ impl MeduzaApp {
             cached_sections:   Vec::new(),
             cached_search:     Vec::new(),
             cached_max_dim:    200,
+            cache_size_mb:        0.0,
+            cache_size_checked_at: Instant::now(),
         }
     }
 
@@ -190,7 +205,10 @@ impl MeduzaApp {
             use std::io::Read;
 
             let mut hasher = DefaultHasher::new();
+            // Include the URL in the key: a track's thumbnail can change, and
+            // keying on ID alone served a stale image forever.
             id2.hash(&mut hasher);
+            url2.hash(&mut hasher);
             let cache_file = Self::image_cache_dir().join(format!("{}.img", hasher.finish()));
 
             let mut raw: Option<Vec<u8>> = None;
@@ -708,24 +726,28 @@ impl MeduzaApp {
                 });
             });
 
-        if changed && !self.search_query.is_empty() {
-            let q   = self.search_query.clone();
-            let sug = Arc::clone(&self.suggestions);
-            let it  = Arc::clone(&self.viewmodel.innertube);
-            self.show_suggest = true;
-            self.viewmodel.runtime.spawn(async move {
-                let s = it.fetch_search_suggestions(&q).await;
-                *sug.lock().unwrap() = s;
-            });
+        if changed {
+            if let Ok(mut g) = self.suggestions.try_lock() { g.clear(); }
+            if self.search_query.is_empty() {
+                self.pending_suggest = None;
+                self.show_suggest = false;
+            } else {
+                self.pending_suggest = Some(self.search_query.clone());
+                self.suggest_changed_at = Instant::now();
+                self.show_suggest = true;
+            }
         }
 
         if enter_pressed {
+            self.pending_suggest = None;
             self.show_suggest = false;
             self.do_search();
         }
 
-        // Suggestions dropdown
-        let sugs = self.suggestions.lock().unwrap().clone();
+        // Suggestions dropdown — try_lock so a slow worker can never stall a frame.
+        let sugs = self.suggestions.try_lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         if self.show_suggest && !sugs.is_empty() {
             for sug in sugs.iter().take(5) {
                 let sr = ui.add(
@@ -1210,7 +1232,11 @@ impl MeduzaApp {
                 );
                 ui.add_space(16.0);
 
-                let mut settings = self.viewmodel.playback.settings.lock().unwrap().clone();
+                // try_lock: never block a UI frame waiting on a worker thread.
+                let mut settings = {
+                    let Ok(guard) = self.viewmodel.playback.settings.try_lock() else { return; };
+                    guard.clone()
+                };
                 let mut changed  = false;
 
                 // ── 1. Audio Quality & Bitrate ──────────────────────────────
@@ -1275,14 +1301,26 @@ impl MeduzaApp {
                 ) { changed = true; }
                 ui.add_space(12.0);
 
-                let cache_size_mb = self.viewmodel.playback.data_saver.lock().unwrap().get_cache_size_mb();
+                // get_cache_size_mb() scans the whole cache directory — do it
+                // at most once every 2s instead of on every rendered frame.
+                if self.cache_size_checked_at.elapsed() >= Duration::from_secs(2) {
+                    self.cache_size_checked_at = Instant::now();
+                    if let Ok(ds) = self.viewmodel.playback.data_saver.try_lock() {
+                        self.cache_size_mb = ds.get_cache_size_mb();
+                    }
+                }
+                let cache_size_mb = self.cache_size_mb;
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(format!("Current Audio Cache: {:.1} MB", cache_size_mb)).color(T_SEC).font(FontId::proportional(14.0)));
                     ui.add_space(16.0);
                     if ui.add(egui::Button::new(
                         RichText::new("Clear Audio Cache").color(Color32::from_rgb(255, 100, 100)).font(FontId::proportional(13.0))
                     ).fill(Color32::from_rgb(45, 20, 20)).rounding(Rounding::same(8.0))).clicked() {
-                        self.viewmodel.playback.data_saver.lock().unwrap().clear_cache();
+                        if let Ok(ds) = self.viewmodel.playback.data_saver.try_lock() {
+                            ds.clear_cache();
+                        }
+                        self.cache_size_mb = 0.0;
+                        self.cache_size_checked_at = Instant::now();
                     }
                 });
 
@@ -1369,7 +1407,9 @@ impl MeduzaApp {
 
                 if changed {
                     settings.save();
-                    *self.viewmodel.playback.settings.lock().unwrap() = settings;
+                    if let Ok(mut guard) = self.viewmodel.playback.settings.try_lock() {
+                        *guard = settings;
+                    }
                 }
             });
     }
@@ -1798,6 +1838,24 @@ fn fmt_time(secs: u32) -> String {
 impl eframe::App for MeduzaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
+        // Debounced suggestion fetch: only start a request 180 ms after the
+        // last keystroke, and ignore any response from a superseded query.
+        if let Some(q) = self.pending_suggest.take() {
+            if self.suggest_changed_at.elapsed() >= Duration::from_millis(180) {
+                let sug = Arc::clone(&self.suggestions);
+                let it  = Arc::clone(&self.viewmodel.innertube);
+                let gen = self.suggest_gen.fetch_add(1, Ordering::SeqCst) + 1;
+                let gen_c = Arc::clone(&self.suggest_gen);
+                self.viewmodel.runtime.spawn(async move {
+                    let s = it.fetch_search_suggestions(&q).await;
+                    if gen_c.load(Ordering::SeqCst) != gen { return; }
+                    if let Ok(mut g) = sug.try_lock() { *g = s; }
+                });
+            } else {
+                self.pending_suggest = Some(q);
+            }
+        }
+
         // Handle auto advance
         self.viewmodel.playback.handle_auto_advance();
 
@@ -1824,12 +1882,18 @@ impl eframe::App for MeduzaApp {
             .map(|g| g.clone())
             .unwrap_or(PlaybackState::Idle);
         if matches!(st, PlaybackState::Playing) {
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            // Poll at the configured cadence (~10 fps) so the progress bar is
+            // smooth and auto-advance has low latency. 1 fps here made track
+            // transitions lag by up to a full second.
+            let ms = self.viewmodel.playback.settings.try_lock()
+                .map(|s| s.now_playing_frame_ms())
+                .unwrap_or(100);
+            ctx.request_repaint_after(Duration::from_millis(ms));
         } else if matches!(st, PlaybackState::Loading)
             || self.viewmodel.is_loading_home.load(std::sync::atomic::Ordering::SeqCst)
             || self.viewmodel.is_searching.load(std::sync::atomic::Ordering::SeqCst)
         {
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            ctx.request_repaint_after(Duration::from_millis(250));
         }
 
         if self.show_now_playing {

@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
@@ -877,16 +877,19 @@ impl PlaybackManager {
             if seq_arc.load(Ordering::SeqCst) != seq_val { return; }
             if radio_tracks.is_empty() { return; }
 
-            let warm_ids: Vec<String> = radio_tracks.iter().take(2)
-                .map(|t| t.media_id.clone()).collect();
-
             let mut q = lk!(queue_c);
-            let existing_ids: std::collections::HashSet<String> =
+            let mut existing_ids: std::collections::HashSet<String> =
                 q.iter().map(|item| item.track.media_id.clone()).collect();
 
             let mut added = 0;
+            let mut warm_ids: Vec<String> = Vec::new();
             for track in radio_tracks {
-                if !existing_ids.contains(&track.media_id) {
+                // Existing IDs is updated as we go so duplicate entries inside
+                // the radio response itself cannot flood the queue.
+                if existing_ids.insert(track.media_id.clone()) {
+                    if warm_ids.len() < 2 {
+                        warm_ids.push(track.media_id.clone());
+                    }
                     q.push(QueueItem { track });
                     added += 1;
                 }
@@ -1204,13 +1207,32 @@ fn ipc_get_status(stream_opt: &mut Option<BufReader<UnixStream>>) -> MpvStatus {
         let mut line = String::new();
         let mut received_responses = 0;
         let mut reads = 0;
-        // BUG-11: Cap reads at 10 (was 50) — worst case now 500ms not 7.5s
-        while received_responses < 4 && reads < 10 {
+        let mut idle_reads = 0;
+        // Events (property-change, etc.) share this socket and are not
+        // responses to our request_ids, so allow extra reads for them. The
+        // read timeout bounds each attempt, and we stop after a few consecutive
+        // timeouts rather than treating them as a disconnect.
+        while received_responses < 4 && reads < 64 {
             reads += 1;
             line.clear();
-            if reader.read_line(&mut line).unwrap_or(0) == 0 {
-                *stream_opt = None; // Connection closed or timeout
-                break;
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    // Real EOF: mpv closed the socket.
+                    *stream_opt = None;
+                    break;
+                }
+                Ok(_) => idle_reads = 0,
+                Err(ref e)
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted) =>
+                {
+                    idle_reads += 1;
+                    if idle_reads >= 3 { break; } // no more data for now; keep socket
+                    continue;
+                }
+                Err(_) => {
+                    *stream_opt = None;
+                    break;
+                }
             }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
                 if let Some(req_id) = v.get("request_id").and_then(|id| id.as_u64().map(|u| u as usize)) {

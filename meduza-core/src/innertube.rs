@@ -111,14 +111,19 @@ impl InnerTubeClient {
             for key in *path { cur = &cur[key]; }
             if let Some(thumbs) = cur.as_array() {
                 if let Some(last) = thumbs.last() {
-                    if let Some(url) = last["url"].as_str() {
-                        // Strip size params to get high-quality square thumbnail
-                        let clean = url.split('=').next().unwrap_or(url);
-                        let mut url_fixed = clean.to_string();
-                        if url_fixed.starts_with("//") {
-                            url_fixed = format!("https:{}", url_fixed);
-                        }
-                        return format!("{}=w400-h400-l90-rj", url_fixed);
+                    if let Some(raw_url) = last["url"].as_str() {
+                        // Normalize protocol-relative URLs. Never split on
+                        // '=': signed YouTube thumbnail URLs carry `sqp=`/`sigh=`
+                        // query values, and truncating there corrupts them.
+                        let with_scheme = if raw_url.starts_with("//") {
+                            format!("https:{}", raw_url)
+                        } else {
+                            raw_url.to_string()
+                        };
+                        // `thumbnails.last()` is already the largest variant.
+                        // Keep its signed query string intact — rewriting
+                        // `sqp`/`sigh` makes the CDN reject the request.
+                        return with_scheme;
                     }
                 }
             }
@@ -126,19 +131,27 @@ impl InnerTubeClient {
         format!("https://i.ytimg.com/vi/{}/hqdefault.jpg", video_id)
     }
 
+    /// Join all text runs. Titles/artists are frequently split into multiple
+    /// runs (e.g. "Artist" + " feat. " + "Guest"), so taking only runs[0]
+    /// silently truncated metadata.
     fn text_run(v: &serde_json::Value) -> String {
         v.as_array()
-            .and_then(|runs| runs.first())
-            .and_then(|r| r["text"].as_str())
-            .unwrap_or("")
-            .to_string()
+            .map(|runs| {
+                runs.iter()
+                    .filter_map(|r| r["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default()
     }
 
     fn parse_duration(s: &str) -> u32 {
-        let parts: Vec<u32> = s.split(':').filter_map(|p| p.parse().ok()).collect();
-        match parts.len() {
-            2 => parts[0] * 60 + parts[1],
-            3 => parts[0] * 3600 + parts[1] * 60 + parts[2],
+        // Fail fast on a malformed component: filter_map used to shift the
+        // remaining parts and produce a plausible-but-wrong duration.
+        let parts: Option<Vec<u32>> = s.split(':').map(|p| p.trim().parse::<u32>().ok()).collect();
+        match parts.as_deref() {
+            Some([m, sec]) => m * 60 + sec,
+            Some([h, m, sec]) => h * 3600 + m * 60 + sec,
             _ => 0,
         }
     }
@@ -154,8 +167,9 @@ impl InnerTubeClient {
             })?;
         if vid.len() != 11 { return None; }
 
-        let title = r["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]
-            ["text"]["runs"][0]["text"].as_str().unwrap_or("").to_string();
+        let title = Self::text_run(
+            &r["flexColumns"][0]["musicResponsiveListItemFlexColumnRenderer"]["text"]["runs"],
+        );
         if title.is_empty() { return None; }
 
         // Extract artist by joining text runs from the second flex column, skipping metadata labels
