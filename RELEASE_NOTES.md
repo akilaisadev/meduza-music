@@ -1,15 +1,16 @@
-# 🎵 Meduza Music v1.2.0 
+# 🎵 Meduza Music v1.3.0
 
 ## What's New
-- **Lazy Loading Implementation**: The home feed grid now utilizes aggressive lazy loading and view-culling, drastically reducing GPU/CPU consumption and completely eliminating scrolling flicker on large libraries!
-- **Library Saving Architecture Fix**: Liked tracks and your history are no longer cross-filtered. Saving a track correctly adds it to your "Your Library" view without latency.
-- **Improved Background Threading**: "Like" toggling has been moved to a background thread to prevent UI freezing.
-- **Robust Auto-Skipping**: Broken YouTube Music stream resolutions or dead tracks now automatically skip and gracefully remove themselves from your playback queue to prevent silent hang-ups.
-- **Streamlined UI Layout**: The visual padding and home feed elements have been refined for a sleeker, more premium look.
+- **Modern UI refresh**: unified design tokens, collapsible icon-rail sidebar, raised active navigation pills, hover play affordances on album cards, recent-search chip, and an Appearance section with a one-click zoom reset.
+- **Pinch / Ctrl+scroll zoom**: the whole UI scales from its comfortable 100% default; **Ctrl+0** restores the default, and **Ctrl+K** jumps to search.
+- **Playback reliability**: bundled a current `yt-dlp` in the `.deb`, pass a JS runtime explicitly, and fixed the invalid mpv flag that prevented playback on mpv 0.37.
+- **Streaming**: audio URLs now resolve reliably against current YouTube; cached CDN links are still validated and expired links are re-resolved.
 
-## Installation
-You can install this update by downloading the `.flatpak` bundle below and running:
+## Installation (Debian / Ubuntu)
+Download the `.deb` below and install it:
 
 ```bash
-flatpak install --user Meduza_Music-1.2.0-x86_64.flatpak
+sudo apt install ./meduza-music_1.3.0_amd64.deb
 ```
+
+The package bundles a recent `yt-dlp` and requires `mpv` plus a JavaScript runtime (`nodejs`), so streams keep working on distributions whose own `yt-dlp` is outdated.

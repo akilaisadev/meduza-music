@@ -6,7 +6,7 @@ APP_NAME="MeduzaMusic"
 # `meduza-music` inside the AppDir to match the desktop file.
 BUILD_BINARY="meduza-ui"
 EXEC_NAME="meduza-music"
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 echo "Building AppImage for $APP_NAME v$VERSION..."
 
