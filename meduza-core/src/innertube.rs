@@ -149,9 +149,14 @@ impl InnerTubeClient {
         // Fail fast on a malformed component: filter_map used to shift the
         // remaining parts and produce a plausible-but-wrong duration.
         let parts: Option<Vec<u32>> = s.split(':').map(|p| p.trim().parse::<u32>().ok()).collect();
+        // Saturating: a hostile or garbage value must not overflow (panic in
+        // debug builds, wrap to a bogus length in release).
         match parts.as_deref() {
-            Some([m, sec]) => m * 60 + sec,
-            Some([h, m, sec]) => h * 3600 + m * 60 + sec,
+            Some([m, sec]) => m.saturating_mul(60).saturating_add(*sec),
+            Some([h, m, sec]) => h
+                .saturating_mul(3600)
+                .saturating_add(m.saturating_mul(60))
+                .saturating_add(*sec),
             _ => 0,
         }
     }
@@ -637,5 +642,19 @@ impl InnerTubeClient {
             }
         }
         suggestions
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_handles_minutes_hours_and_garbage() {
+        assert_eq!(InnerTubeClient::parse_duration("3:05"), 185);
+        assert_eq!(InnerTubeClient::parse_duration("1:02:03"), 3723);
+        assert_eq!(InnerTubeClient::parse_duration("3:xx"), 0);
+        // Must not overflow (panic in debug builds).
+        assert_eq!(InnerTubeClient::parse_duration("4000000000:00"), u32::MAX);
     }
 }

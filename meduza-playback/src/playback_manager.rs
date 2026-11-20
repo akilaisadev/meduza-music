@@ -52,8 +52,6 @@ pub struct PlaybackManager {
     pub data_saver:            Arc<Mutex<meduza_core::data_saver::DataSaver>>,
     pub recommendation_engine: Arc<Mutex<meduza_core::recommendation_engine::RecommendationEngine>>,
     pub playback_seq:          Arc<AtomicU64>,
-    // Shared paused flag for IPC reconnect re-send
-    is_paused_flag: Arc<std::sync::atomic::AtomicBool>,
     /// Set by Drop so the IPC poller thread exits instead of leaking forever.
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 
@@ -126,8 +124,7 @@ impl PlaybackManager {
         let is_shuffle    = Arc::new(Mutex::new(false));
         let repeat_mode   = Arc::new(Mutex::new(RepeatMode::Off));
         let playback_seq    = Arc::new(AtomicU64::new(0));
-        let is_paused_flag  = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let shutdown        = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown       = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // ── Background IPC poller (runs every 100 ms, handles gapless transitions & track-ended signalling) ──
         let state_bg    = Arc::clone(&state);
@@ -142,7 +139,6 @@ impl PlaybackManager {
         let ds_bg       = Arc::clone(&data_saver);
         let settings_bg = Arc::clone(&settings);
         let inner_bg    = Arc::clone(&innertube);
-        let paused_bg   = Arc::clone(&is_paused_flag);
         let seq_bg      = Arc::clone(&playback_seq);
         let rep_bg      = Arc::clone(&repeat_mode);
         let shutdown_bg = Arc::clone(&shutdown);
@@ -171,8 +167,9 @@ impl PlaybackManager {
                 // BUG-01: Detect reconnect by tracking connection state
                 let now_connected = stream_opt.is_some();
                 if !was_connected && now_connected {
-                    // Just (re)connected — re-send pause state to sync mpv
-                    if paused_bg.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Just (re)connected — re-send pause state to sync mpv. Use the
+                    // authoritative state: a separate flag went stale on track changes.
+                    if matches!(*lk!(state_bg), PlaybackState::Paused) {
                         ipc_send(serde_json::json!({"command":["set_property","pause",true]}));
                     }
                 }
@@ -240,7 +237,20 @@ impl PlaybackManager {
                         if !q.is_empty() {
                             let mut idx_guard = lk!(idx_bg);
                             let cur = *idx_guard;
-                            let next_idx = if cur + 1 < q.len() { cur + 1 } else { 0 };
+                            // The preloader appended a specific track (random under
+                            // shuffle) and recorded its id in stream_cache. Advance to
+                            // exactly that track so the UI and the audio agree.
+                            let sequential = if cur + 1 < q.len() { cur + 1 } else { 0 };
+                            let appended_vid: Option<String> = lk!(cache_bg)
+                                .as_ref()
+                                .map(|(vid, _): &(String, String)| vid.clone());
+                            let next_idx = match appended_vid {
+                                Some(ref vid) if q[sequential].track.media_id != *vid => q
+                                    .iter()
+                                    .position(|item| item.track.media_id == *vid)
+                                    .unwrap_or(sequential),
+                                _ => sequential,
+                            };
                             // Bounds-safe access under combined lock
                             let next_track = q[next_idx].track.clone();
                             let remaining = q.len().saturating_sub(next_idx + 1);
@@ -323,8 +333,13 @@ impl PlaybackManager {
             let _ = std::fs::remove_dir(&liked_path);
         }
         if let Ok(json_str) = std::fs::read_to_string(&liked_path) {
-            if let Ok(parsed) = serde_json::from_str::<Vec<TrackItem>>(&json_str) {
-                loaded_liked = parsed;
+            match serde_json::from_str::<Vec<TrackItem>>(&json_str) {
+                Ok(parsed) => loaded_liked = parsed,
+                Err(e) => {
+                    // Keep the unreadable file: the next save would overwrite it.
+                    eprintln!("[Playback] liked_songs.json is unreadable ({}); keeping a backup.", e);
+                    let _ = std::fs::rename(&liked_path, liked_path.with_extension("json.corrupt"));
+                }
             }
         }
 
@@ -349,7 +364,6 @@ impl PlaybackManager {
             data_saver,
             recommendation_engine,
             playback_seq,
-            is_paused_flag,
             shutdown,
             mpv_process:   mpv_proc,
             innertube,
@@ -429,7 +443,12 @@ impl PlaybackManager {
                 }
             }
 
-            ensure_mpv_running(&mpv_proc, lk!(settings_c).mpv_small_buffer());
+            if !ensure_mpv_running(&mpv_proc, lk!(settings_c).mpv_small_buffer()) {
+                if seq_c.load(Ordering::SeqCst) == seq {
+                    *lk!(state_c) = PlaybackState::Error("mpv could not be started. Is mpv installed?".to_string());
+                }
+                return;
+            }
 
             // Record user taste activity
             lk!(reco_c).record_play(track_to_reco.clone());
@@ -534,13 +553,11 @@ impl PlaybackManager {
                 // BUG-09: Only update Rust state if IPC send succeeds
                 if ipc_send_reliable(serde_json::json!({"command":["set_property","pause",true]})) {
                     *lk!(self.state) = PlaybackState::Paused;
-                    self.is_paused_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             PlaybackState::Paused => {
                 if ipc_send_reliable(serde_json::json!({"command":["set_property","pause",false]})) {
                     *lk!(self.state) = PlaybackState::Playing;
-                    self.is_paused_flag.store(false, std::sync::atomic::Ordering::SeqCst);
                 }
             }
             _ => {}
@@ -658,13 +675,17 @@ impl PlaybackManager {
         let title    = track.title.clone();
         let settings_c2 = Arc::clone(&self.settings);
         let ended_c  = Arc::clone(&self.track_ended);
-        let queue_c  = Arc::clone(&self.queue);
-        let idx_c    = Arc::clone(&self.queue_index);
+        let repeat_c = Arc::clone(&self.repeat_mode);
 
         meduza_core::workers::io().submit(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
-            ensure_mpv_running(&mpv_proc, lk!(settings_c2).mpv_small_buffer());
+            if !ensure_mpv_running(&mpv_proc, lk!(settings_c2).mpv_small_buffer()) {
+                if seq_c.load(Ordering::SeqCst) == seq {
+                    *lk!(state_c) = PlaybackState::Error("mpv could not be started. Is mpv installed?".to_string());
+                }
+                return;
+            }
             println!("[Playback] Resolving stream for '{}' ({})", title, video_id);
             
             let cached_url = {
@@ -685,20 +706,15 @@ impl PlaybackManager {
                 url
             } else {
                 if seq_c.load(Ordering::SeqCst) == seq {
-                    println!("[Playback] Stream resolution failed for '{}'. Auto-skipping broken track.", title);
-                    {
-                        let mut q = lk!(queue_c);
-                        let mut i = lk!(idx_c);
-                        if *i < q.len() && q[*i].track.media_id == video_id {
-                            q.remove(*i);
-                            // Keep index same so the next track slides into this index, but if we were at the end, clamp it
-                            if *i >= q.len() && *i > 0 {
-                                *i -= 1;
-                            }
-                        }
-                    }
+                    println!("[Playback] Stream resolution failed for '{}'. Auto-skipping.", title);
                     *lk!(state_c) = PlaybackState::Error(format!("Could not resolve stream URL for {}. Skipping...", title));
-                    *lk!(ended_c) = true; // Triggers handle_auto_advance
+                    // Let auto-advance move on. The track is NOT removed from the
+                    // queue: auto-advance steps forward by one index, so a removal
+                    // would skip the track that slid into this slot. Repeat-One
+                    // would replay the broken track forever, so it stops instead.
+                    if *lk!(repeat_c) != RepeatMode::One {
+                        *lk!(ended_c) = true; // Triggers handle_auto_advance
+                    }
                 }
                 return;
             };
@@ -1035,7 +1051,12 @@ impl PlaybackManager {
 
         meduza_core::workers::io().submit(move || {
             if seq_spawn.load(Ordering::SeqCst) != seq { return; }
-            ensure_mpv_running(&mpv_proc_spawn, lk!(settings_c_spawn).mpv_small_buffer());
+            if !ensure_mpv_running(&mpv_proc_spawn, lk!(settings_c_spawn).mpv_small_buffer()) {
+                if seq_spawn.load(Ordering::SeqCst) == seq {
+                    *lk!(state_c_spawn) = PlaybackState::Error("mpv could not be started. Is mpv installed?".to_string());
+                }
+                return;
+            }
 
             let cached_url = {
                 let mut c = lk!(cache_c_spawn);
@@ -1149,13 +1170,10 @@ impl PlaybackManager {
         
         let path = meduza_core::settings::app_config_dir().join("liked_songs.json");
         if let Ok(json_str) = serde_json::to_string(&*liked) {
-            meduza_core::workers::io().submit(move || {
-                // write_private creates the parent dir and writes 0600 atomically
-                // enough for this use case. Never call ensure_private_dir on the
-                // file path itself — that would create a directory named
-                // "liked_songs.json" and silently discard every like.
-                let _ = meduza_core::settings::write_private(&path, &json_str);
-            });
+            // Written synchronously while the lock is held: an async write could
+            // land out of order with a later toggle and persist a stale list.
+            // write_private creates the parent dir, never the file path itself.
+            let _ = meduza_core::settings::write_private(&path, &json_str);
         }
     }
 
@@ -1213,14 +1231,52 @@ impl PlaybackManager {
                 .map(|p| p.tracks.clone())
                 .unwrap_or_default()
         };
+        self.play_tracks(tracks);
+    }
+
+    /// Replace the queue with `tracks` and start the first one.
+    pub fn play_tracks(&self, tracks: Vec<TrackItem>) {
+        self.play_tracks_at(tracks, 0);
+    }
+
+    /// Replace the queue with `tracks` and start at position `start`.
+    pub fn play_tracks_at(&self, tracks: Vec<TrackItem>, start: usize) {
         if tracks.is_empty() { return; }
-        let first = tracks[0].clone();
-        {
-            let mut q = lk!(self.queue);
-            *q = tracks.into_iter().map(|t| QueueItem { track: t }).collect();
-        }
-        *lk!(self.queue_index) = 0;
+        let start = start.min(tracks.len() - 1);
+        let first = tracks[start].clone();
+        *lk!(self.queue) = tracks.into_iter().map(|t| QueueItem { track: t }).collect();
+        *lk!(self.queue_index) = start;
         self.play_now_without_queue_reset(first);
+    }
+
+    /// Jump to an entry of the current queue without rebuilding it.
+    pub fn play_queue_at(&self, index: usize) {
+        let track = {
+            let q = lk!(self.queue);
+            match q.get(index) {
+                Some(item) => item.track.clone(),
+                None => return,
+            }
+        };
+        *lk!(self.queue_index) = index;
+        self.play_now_without_queue_reset(track);
+    }
+
+    /// Insert `track` so it plays right after the current one.
+    pub fn queue_next(&self, track: TrackItem) {
+        let mut q = lk!(self.queue);
+        if q.is_empty() {
+            q.push(QueueItem { track });
+            *lk!(self.queue_index) = 0;
+            return;
+        }
+        let at = (*lk!(self.queue_index) + 1).min(q.len());
+        q.insert(at, QueueItem { track });
+    }
+
+    /// Append `track` to the end of the queue.
+    pub fn queue_last(&self, track: TrackItem) {
+        lk!(self.queue).push(QueueItem { track });
     }
 
     pub fn import_playlists(&self, path: &std::path::Path) -> Result<usize, String> {
@@ -1437,11 +1493,14 @@ fn kill_stale_mpv() {
 /// Launch mpv idle process if not already running. `small_buffer` (low-end
 /// profile) trades a little read-ahead/ahead-caching for a smaller resident
 /// memory footprint and gentler disk/network usage.
-fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: bool) {
+/// Returns `true` when mpv is running and its IPC socket is ready, `false` when
+/// it could not be started. Callers must surface `false` as an error: otherwise
+/// the UI reports "Playing" for audio that never plays.
+fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: bool) -> bool {
     let mut proc = lk!(mpv_process);
     if let Some(ref mut child) = *proc {
         if child.try_wait().ok().flatten().is_none() {
-            return; // already alive
+            return true; // already alive
         }
     }
     // Child died or never started — clean up and restart
@@ -1504,7 +1563,7 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: boo
         Err(e) => {
             eprintln!("[Playback] ERROR: Failed to launch mpv: {}", e);
             eprintln!("[Playback] Install mpv: sudo apt install mpv");
-            return;
+            return false;
         }
     };
 
@@ -1528,8 +1587,10 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: boo
         // mpv.log contains full CDN stream URLs (signed tokens) — owner-only.
         let _ = std::fs::set_permissions(&log_file_path, std::fs::Permissions::from_mode(0o600));
         println!("[Playback] mpv IPC ready at {}", socket.display());
+        true
     } else {
         eprintln!("[Playback] WARNING: mpv socket not found at {} after 3s", socket.display());
+        false
     }
 }
 
