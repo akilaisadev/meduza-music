@@ -34,7 +34,6 @@ pub struct AppViewModel {
     // Lyrics for the current track (issue #7)
     pub lyrics: RwLock<Lyrics>,
     pub lyrics_track_id: RwLock<Option<String>>,
-    lyrics_loading: AtomicBool,
     lyrics_generation: AtomicU64,
 }
 
@@ -62,7 +61,6 @@ impl AppViewModel {
             search_generation: AtomicU64::new(0),
             lyrics: RwLock::new(Lyrics::default()),
             lyrics_track_id: RwLock::new(None),
-            lyrics_loading: AtomicBool::new(false),
             lyrics_generation: AtomicU64::new(0),
         });
 
@@ -261,9 +259,6 @@ impl AppViewModel {
                 return;
             }
         }
-        if self.lyrics_loading.swap(true, Ordering::SeqCst) {
-            return;
-        }
         let gen = self.lyrics_generation.fetch_add(1, Ordering::SeqCst) + 1;
         if let Ok(mut id) = self.lyrics_track_id.write() {
             *id = Some(track.media_id.clone());
@@ -281,7 +276,6 @@ impl AppViewModel {
             if let Ok(mut l) = vm.lyrics.write() {
                 *l = result.unwrap_or_default();
             }
-            vm.lyrics_loading.store(false, Ordering::SeqCst);
             vm.data_version.fetch_add(1, Ordering::SeqCst);
         });
     }

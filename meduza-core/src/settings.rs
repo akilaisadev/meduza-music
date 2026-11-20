@@ -25,8 +25,6 @@ pub struct AppSettings {
     /// 1 = only the next track (classic behaviour).
     #[serde(default = "default_preload_buffer")]
     pub preload_buffer_tracks: usize,
-    #[serde(default)]
-    pub normalize_volume: bool,
     pub low_end_mode: bool,
     pub max_cache_size_mb: u64,
 }
@@ -40,7 +38,6 @@ impl Default for AppSettings {
             autoplay_radio: true,
             preload_next_track: true,
             preload_buffer_tracks: 1,
-            normalize_volume: true,
             low_end_mode: false,
             max_cache_size_mb: 500,
         }
@@ -328,11 +325,6 @@ impl AppSettings {
         if self.low_end_mode { 200 } else { 100 }
     }
 
-    /// Layered glowing ambient-ink background behind the now-playing vinyl.
-    pub fn ambient_glow(&self) -> bool {
-        !self.low_end_mode
-    }
-
     /// Competing stream resolutions to race (single resolve on low-end).
     pub fn resolve_racing(&self) -> bool {
         !self.low_end_mode
@@ -341,11 +333,6 @@ impl AppSettings {
     /// Concurrent browse calls when assembling the home feed / radio queue.
     pub fn home_feed_parallel(&self) -> usize {
         if self.low_end_mode { 1 } else { 5 }
-    }
-
-    /// How many upcoming tracks get their stream URLs pre-resolved.
-    pub fn prefetch_depth(&self) -> usize {
-        if self.low_end_mode { 1 } else { 2 }
     }
 
     /// Max pixel dimension for decoded images (we downscale through the fetch
@@ -364,11 +351,5 @@ impl AppSettings {
     /// reasonably with the audio already playing.
     pub fn pace_downloads(&self) -> bool {
         self.low_end_mode
-    }
-
-    /// Decode (to RGBA) can be heavy; low-end profiles skip dominant-color
-    /// extraction for the ambient background (single deterministic hue instead).
-    pub fn heavy_background(&self) -> bool {
-        !self.low_end_mode
     }
 }

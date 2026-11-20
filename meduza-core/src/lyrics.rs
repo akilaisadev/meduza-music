@@ -52,13 +52,19 @@ impl Lyrics {
 pub fn parse_lrc(input: &str) -> Vec<LyricLine> {
     let mut lines = Vec::new();
     for raw in input.lines() {
-        let line = raw.trim_end();
-        let Some(close) = line.find(']') else { continue; };
-        if !line.starts_with('[') { continue; }
-        let text = line[close + 1..].trim();
-        let stamps = &line[1..close];
-        for stamp in stamps.split(']') {
-            if let Some(secs) = parse_timestamp(stamp.trim()) {
+        let mut rest = raw.trim_end();
+        let mut stamps = Vec::new();
+        // Consume all leading [mm:ss.xx] tags so repeated/refrain timestamps
+        // on one line are all honoured. Metadata tags like [ar:...] simply
+        // fail parse_timestamp and are ignored.
+        while let Some(stripped) = rest.strip_prefix('[') {
+            let Some(close) = stripped.find(']') else { break; };
+            stamps.push(&stripped[..close]);
+            rest = &stripped[close + 1..];
+        }
+        let text = rest.trim();
+        for stamp in stamps {
+            if let Some(secs) = parse_timestamp(stamp) {
                 lines.push(LyricLine { time: secs, text: text.to_string() });
             }
         }
@@ -139,6 +145,17 @@ mod tests {
         assert_eq!(lines[0].text, "First line");
         assert!((lines[1].time - 62.5).abs() < 0.01);
         assert!((lines[2].time - 123.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn parses_multiple_timestamps_and_ignores_metadata() {
+        let lrc = "[ar:Artist]\n[ti:Title]\n[00:01.00]Refrain\n[00:05.00][00:10.00]Same line";
+        let lines = parse_lrc(lrc);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0].text, "Refrain");
+        assert_eq!(lines[1].time, 5.0);
+        assert_eq!(lines[2].time, 10.0);
+        assert_eq!(lines[1].text, lines[2].text);
     }
 
     #[test]

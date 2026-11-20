@@ -279,12 +279,24 @@ impl MeduzaApp {
                         {
                             let mut r = rgba2.lock().unwrap();
                             r.insert(id2.clone(), tex_px);
-                            if r.len() > 96 { r.clear(); }
+                            // Evict a small batch instead of clearing everything —
+                            // a full clear forces every visible thumbnail to be
+                            // decoded again on the next scroll.
+                            while r.len() > 96 {
+                                let Some(k) = r.keys().next().cloned() else { break; };
+                                r.remove(&k);
+                            }
                         }
                         {
                             let mut g = p2.lock().unwrap();
-                            g.insert(id2, Some(bytes));
-                            if g.len() > 96 { g.clear(); }
+                            // `pending` is only a completion marker; the decoded
+                            // pixels live in `rgba`. Keeping the raw bytes here
+                            // retained up to 96 × 5 MB of image data.
+                            g.insert(id2, Some(Vec::new()));
+                            while g.len() > 96 {
+                                let Some(k) = g.keys().next().cloned() else { break; };
+                                g.remove(&k);
+                            }
                         }
                         ctx.request_repaint();
                     } else {
@@ -707,6 +719,7 @@ impl MeduzaApp {
         );
 
         // Add-to-playlist button (visible on hover)
+        let mut add_clicked = false;
         if response.hovered() {
             let btn_rect = egui::Rect::from_min_size(
                 rect.max - egui::vec2(34.0, 34.0),
@@ -716,11 +729,12 @@ impl MeduzaApp {
                 RichText::new("+").color(Color32::BLACK).font(FontId::proportional(16.0)).strong()
             ).fill(ACCENT).rounding(Rounding::same(13.0));
             if ui.put(btn_rect, btn).on_hover_text("Add to playlist…").clicked() {
+                add_clicked = true;
                 self.add_to_playlist_target = Some(track.clone());
             }
         }
 
-        if response.clicked() {
+        if response.clicked() && !add_clicked {
             self.viewmodel.playback.play_now(track.clone());
         }
     }
@@ -939,15 +953,17 @@ impl MeduzaApp {
             }
 
             // Add-to-playlist button
+            let mut add_clicked = false;
             let btn_rect = egui::Rect::from_center_size(
                 egui::pos2(rect.max.x - 76.0, rect.center().y), Vec2::splat(24.0));
             if ui.put(btn_rect, egui::Button::new(
                 RichText::new("+").color(T_SEC).font(FontId::proportional(16.0))
             ).frame(false)).on_hover_text("Add to playlist…").clicked() {
+                add_clicked = true;
                 self.add_to_playlist_target = Some(track.clone());
             }
 
-            if resp.clicked() { self.viewmodel.playback.play_now(track.clone()); }
+            if resp.clicked() && !add_clicked { self.viewmodel.playback.play_now(track.clone()); }
         }
     }
 
@@ -1749,7 +1765,7 @@ impl MeduzaApp {
                     Vec2::new(90.0, 36.0),
                 );
                 if ui.put(lyrics_btn_r, egui::Button::new(
-                    RichText::new(if self.show_lyrics { "♫ Lyrics" } else { "♫ Lyrics" })
+                    RichText::new(if self.show_lyrics { "♫ Lyrics ✓" } else { "♫ Lyrics" })
                         .font(FontId::proportional(12.0))
                         .color(if self.show_lyrics { ACCENT } else { T_SEC })
                 ).fill(Color32::from_rgb(34, 34, 40)).rounding(Rounding::same(8.0)))

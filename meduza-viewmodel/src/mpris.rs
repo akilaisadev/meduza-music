@@ -84,6 +84,7 @@ fn sync_loop(mut controls: MediaControls, weak: Weak<PlaybackManager>) {
     let mut last_track_id: Option<String> = None;
     let mut last_state = PlaybackState::Idle;
     let mut last_volume = -1.0f32;
+    let mut last_playback_publish = std::time::Instant::now();
 
     loop {
         std::thread::sleep(Duration::from_millis(250));
@@ -114,7 +115,11 @@ fn sync_loop(mut controls: MediaControls, weak: Weak<PlaybackManager>) {
             last_track_id = track.map(|t| t.media_id);
         }
 
-        if state != last_state {
+        // MPRIS clients read position from the last published playback state,
+        // so refresh it roughly once a second while playing.
+        let position_refresh = state == PlaybackState::Playing
+            && last_playback_publish.elapsed() >= Duration::from_secs(1);
+        if state != last_state || position_refresh {
             let playback_status = match state {
                 PlaybackState::Playing | PlaybackState::Loading => {
                     MediaPlayback::Playing { progress }
@@ -124,6 +129,7 @@ fn sync_loop(mut controls: MediaControls, weak: Weak<PlaybackManager>) {
             };
             let _ = controls.set_playback(playback_status);
             last_state = state;
+            last_playback_publish = std::time::Instant::now();
         }
 
         if (volume - last_volume).abs() > 0.5 {

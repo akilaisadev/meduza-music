@@ -38,7 +38,7 @@ Cinematic full-screen player with spinning vinyl record disc animation, alongsid
 <br />
 
 ### ⚙️ Settings Control Center & 💚 Library
-Toggle low-end hardware mode, seamless 0ms gapless preloader, offline caching, and manage your saved library.
+Toggle low-end hardware mode, gapless preload depth, offline caching, and manage your saved library and playlists.
 
 | ⚙️ Performance & Settings | 💚 Your Library |
 |---|---|
@@ -51,10 +51,12 @@ Toggle low-end hardware mode, seamless 0ms gapless preloader, offline caching, a
 - ⚡ **Extreme Native Performance**: Written 100% in Rust using `egui` and `tokio`. Consumes **<40 MB RAM** (vs 500 MB+ in Electron players).
 - 🎧 **YouTube Music Engine**: Stream millions of songs, albums, and playlists directly via InnerTube API.
 - 🏠 **Smart Home Feed**: Dynamically adapts to your top artists and genres with instant offline session caching.
-- 🔊 **Zero-Latency MPV Player**: Pre-buffers next tracks in background memory for instant gapless transitions.
-- 💾 **Offline Data Saver**: Option to cache played tracks locally for 0-data replays.
+- 🔊 **Low-Latency MPV Player**: Resolves upcoming stream URLs in the background for smooth gapless transitions (buffer size configurable via Low-End mode).
+- 💾 **Offline Data Saver**: Option to cache played audio locally for replay without network access.
 - 🎨 **Glassmorphic Modern UI**: Dark mode UI with custom visual scrollbars, album art caching, and audio spectrum vinyl animations.
-- 🖥️ **System Tray Integration**: Minimize to tray with system notifications (`org.kde.StatusNotifierWatcher`).
+- 📝 **Synchronized Lyrics**: Fetch time-synced lyrics from LRCLIB in the full-screen player.
+- 📚 **Local Playlists**: Build custom playlists, with JSON import/export.
+- 🎹 **Global Media Keys**: MPRIS2 integration for desktop media controls and metadata (Linux).
 
 ---
 
@@ -72,11 +74,11 @@ chmod +x Meduza_Music-*-x86_64.AppImage
 ./Meduza_Music-*-x86_64.AppImage
 ```
 
-AppImages are self-contained and do not require installation. Requires `mpv`, `python3` with `yt_dlp`, the GTK3 runtime, and FUSE (already present on most modern distros).
+AppImages are self-contained and do not require installation. Requires `mpv`, `python3` with `yt_dlp`, and FUSE (already present on most modern distros). No GTK runtime is needed.
 
 ### Option 2: Build from Source (Cargo)
 
-Prerequisites: `cargo`, `mpv`, `python3` + `yt-dlp`, `gtk3`.
+Prerequisites: `cargo`, `mpv`, `python3` + `yt-dlp`.
 
 ```bash
 # 1. Clone the repository

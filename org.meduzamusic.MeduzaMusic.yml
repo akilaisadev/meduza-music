@@ -13,6 +13,7 @@ finish-args:
   - --device=dri
   - --socket=pulseaudio
   - --socket=session-bus
+  - --own-name=org.meduzamusic.MeduzaMusic
   - --talk-name=org.freedesktop.Notifications
 build-options:
   build-args:

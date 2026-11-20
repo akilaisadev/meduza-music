@@ -1,29 +1,54 @@
-# Meduza Music — latency, UI, responsive & flagship intelligence fixes
+# Meduza Music — feature walkthrough
 
-## 1. Flagship User Intelligence System (Active Learning)
-- **Persistent Taste Profile Database:** Built file load/save serialization to `~/.config/meduza/taste_profile.json` so the user's learned preference state is preserved across app restarts.
-- **Implicit Feedback Tracking:**
-  - **Successful Listens:** If a track runs for over 20 seconds, the engine registers a positive play score, reinforcing artist and style keywords.
-  - **Early Skips Penalization:** If a track is skipped within 20 seconds of starting, the engine logs a skip penalty. Repeated early skips decay artist play affinity and penalize style keyword weights negatively (allowing active learning of user dislikes).
-- **Style Keyword Extraction & Genre Affinity:** Implemented an NLP-style keyword tokenizer that cleans track titles and artist names (filtering out common video/audio stopwords) to map user preferences to specific sub-genre concepts (e.g., learning terms like "lofi", "synthwave", "acoustic").
-- **Skip-to-Play Ratio Penalty:** Aggressively suppresses suggestions of tracks that are frequently skipped by the user, dynamically multiplying the final ranking score.
-- **Widescreen Diversity Window:** Shuffling scales track weight penalties based on recent artists in a 5-track sliding window, preventing repetitive artist clusters.
+Meduza Music is a native Rust/egui desktop client for YouTube Music. Audio is
+played by a background `mpv` process controlled over a private Unix IPC socket.
 
-## 2. Immersive Blur Application Theme
-- **Cross-Fade Album Art Background:** Overhauled the main application frame background to render the currently playing track's artwork as a full-bleed background, utilizing a smooth `AnimatedSwitcher` to cross-fade between album art updates.
-- **Backdrop Blurring:** Applied a heavy `BackdropFilter` (90px blur) and dark overlay over the background image, creating an atmospheric, organic color glow that responds dynamically to each song's style.
-- **Frosted Glass Sidebar:** Refactored the left navigation sidebar to be a transparent panel with a `BackdropFilter` (30px blur), allowing the dynamic colored background to bleed through beautifully.
+## Getting around
 
-## 3. Personalization: Real Favorites Grid on Home
-- **Dynamic Liked Songs Grid:** The Home screen now watches the user's Liked Songs playlist via `PlaylistManager`.
-- **Your Favorites Row:** If the user has liked tracks, a personalized row titled **"Your Favorites"** is loaded in the grid container. Liking/unliking a song in the player instantly updates the home grid. Falls back to default Quick Picks if empty.
+- **Home** — a personalized feed assembled from InnerTube shelves (jump back in,
+  heavy rotation, listening history, top artists/mixes). Images are fetched and
+  decoded on worker threads, cached on disk, and throttled on low-end hardware.
+- **Search** — instant InnerTube search with debounced suggestions; results can
+  be played or added to the library.
+- **Your Library** — liked songs plus local playlists. Create, rename, delete,
+  import and export playlists as JSON; add any track with the `+` button.
+- **Settings** — audio quality, cache size, gapless preload depth, low-end mode,
+  and cache maintenance.
+- **Full-screen player** — click the artwork to expand. Includes synchronized
+  lyrics from LRCLIB (toggle with the `♫ Lyrics` button), mouse-wheel volume
+  control over the speaker icon, and transport controls.
 
-## 4. Advanced Hover Micro-Animations & Design Polish
-- **Gradient Shader Greeting:** The Home screen greeting ("Good Evening") now uses a vibrant linear text gradient mask running from white to the accent glow color.
-- **Lifty Translation & Glow Shadow Cards:**
-  - **Quick Picks Grid:** Hovering translates items upward slightly (`-3px`) and paints a soft accent glow shadow.
-  - **Music Cards:** Hovering lifts cards (`-5px`), scales borders, and adds a larger neon hover shadow. Shows a floating play button overlay.
+## Playback
 
----
-Static analysis has been run: **No compilation issues found!** 
-Press `R` in your active terminal to Hot Restart and try out the learning intelligence system!
+- `mpv` runs idle with `--no-config --no-scripts` and a private IPC socket in a
+  0700 runtime directory. The socket and log file are restricted to the owner.
+- Stream URLs are resolved by `yt-dlp` and cached in memory and on disk. Cached
+  URLs are validated against both the local TTL and YouTube's absolute `expire`
+  parameter before use; stale URLs are dropped and re-resolved automatically.
+- A background preloader resolves upcoming queue tracks ahead of time. The
+  number of tracks resolved is configurable (`preload_buffer_tracks`).
+- Shuffle, repeat Off/All/One, and endless radio refills are supported. Global
+  media keys and MPRIS2 metadata work on Linux via the session bus.
+- Likes, playlists, settings and history are written as private (0600) JSON
+  files under the XDG config directory.
+
+## Building and packaging
+
+```bash
+cargo check --workspace       # verify all crates
+cargo test --workspace        # unit tests (LRC parsing, playlist persistence)
+./build_appimage.sh           # build an AppImage
+./build_flatpak.sh            # build/install the Flatpak
+```
+
+No GTK or system D-Bus development headers are required. The Flatpak manifest
+grants access to the session bus so MPRIS2 works inside the sandbox.
+
+## Architecture
+
+| Crate | Responsibility |
+|---|---|
+| `meduza-core` | InnerTube client, settings, URL allowlists, lyrics, playlists, workers |
+| `meduza-playback` | mpv IPC, stream resolution, queue, likes, preloader, persistence |
+| `meduza-viewmodel` | Snapshots, background updater, MPRIS2 integration |
+| `meduza-ui` | egui application, panels, full-screen player, dialogs |

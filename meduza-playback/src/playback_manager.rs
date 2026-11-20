@@ -1130,8 +1130,13 @@ impl PlaybackManager {
         };
     }
 
+    /// UI-only: never block a frame waiting on the persistence worker. If the
+    /// lock is momentarily contended, the next repaint will show the correct
+    /// state (the like snapshot is refreshed every frame).
     pub fn is_liked(&self, media_id: &str) -> bool {
-        lk!(self.liked_songs).iter().any(|t| t.media_id == media_id)
+        self.liked_songs.try_lock()
+            .map(|liked| liked.iter().any(|t| t.media_id == media_id))
+            .unwrap_or(false)
     }
 
     pub fn toggle_like(&self, track: TrackItem) {
@@ -1415,6 +1420,17 @@ fn kill_stale_mpv() {
     let cmdline = std::fs::read_to_string(format!("/proc/{}/cmdline", pid)).unwrap_or_default();
     if cmdline.contains("input-ipc-server") && cmdline.contains("meduza-music") {
         let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).output();
+        // Wait for the old process to actually release the IPC socket before a
+        // new mpv is spawned. Otherwise the replacement can fail to bind, and
+        // we would hand IPC commands to a half-initialised process.
+        let proc_path = format!("/proc/{}/cmdline", pid);
+        for _ in 0..20 {
+            if !std::path::Path::new(&proc_path).exists() { break; }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if std::path::Path::new(&proc_path).exists() {
+            let _ = Command::new("kill").args(["-KILL", &pid.to_string()]).output();
+        }
     }
 }
 
@@ -1449,6 +1465,11 @@ fn ensure_mpv_running(mpv_process: &Arc<Mutex<Option<Child>>>, small_buffer: boo
 
     let child = match cmd
         .args([
+            // Ignore user config/scripts: they could redefine key bindings or
+            // load Lua that calls mpv's `run` command through our IPC socket.
+            "--no-config",
+            "--no-scripts",
+            "--input-conf=/dev/null",
             "--no-video",
             "--idle=yes",
             "--keep-open=yes",
