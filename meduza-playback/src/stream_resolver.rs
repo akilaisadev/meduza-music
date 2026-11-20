@@ -106,8 +106,15 @@ impl StreamResolver {
     /// fall back to the Python module for source/AppImage installs. Detection
     /// is cached so we do not spawn a `--version` process on every resolve.
     fn yt_dlp_cmd() -> Command {
+        // The .deb bundles a current yt-dlp here so it works even when the
+        // desktop session PATH does not include /usr/lib/meduza-music.
+        const BUNDLED: &str = "/usr/lib/meduza-music/yt-dlp";
+
         static USE_BINARY: OnceLock<bool> = OnceLock::new();
         let use_binary = *USE_BINARY.get_or_init(|| {
+            if std::path::Path::new(BUNDLED).exists() {
+                return true;
+            }
             Command::new("yt-dlp")
                 .arg("--version")
                 .stdin(Stdio::null())
@@ -117,8 +124,13 @@ impl StreamResolver {
                 .map(|s| s.success())
                 .unwrap_or(false)
         });
+
         if use_binary {
-            Command::new("yt-dlp")
+            if std::path::Path::new(BUNDLED).exists() {
+                Command::new(BUNDLED)
+            } else {
+                Command::new("yt-dlp")
+            }
         } else {
             let mut cmd = Command::new("python3");
             cmd.args(["-m", "yt_dlp"]);
@@ -231,6 +243,8 @@ impl StreamResolver {
                 "--no-warnings",
                 "--quiet",
                 "--no-playlist",
+                // YouTube now requires a JS runtime for some formats.
+                "--js-runtimes", "node",
                 "--socket-timeout", "5",
                 "--get-url",
                 &url,
