@@ -155,6 +155,7 @@ fn top_result(ui: &mut egui::Ui, cx: &mut Cx, track: &TrackItem) {
     let width = ui.available_width().min(720.0);
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 150.0), Sense::click());
     let hot = ui.ctx().animate_bool(resp.id.with("hot"), resp.hovered());
+    widgets::prefetch_on_dwell(ui, cx, resp.id, resp.hovered(), track);
     ui.painter().rect_filled(rect, Rounding::same(RADIUS_LG), mix(SURFACE, SURFACE_HI, hot));
 
     let art_rect = Rect::from_min_size(rect.min + vec2(18.0, 18.0), vec2(114.0, 114.0));

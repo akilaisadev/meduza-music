@@ -24,6 +24,30 @@ const SEEDS: [Color32; 8] = [
     Color32::from_rgb(40, 70, 130),
 ];
 
+/// Starts resolving a track's stream once the cursor has rested on it for a
+/// moment, so clicking it plays without waiting for yt-dlp. Sweeping across a
+/// list does not trigger it, and each hover prefetches at most once.
+pub fn prefetch_on_dwell(ui: &egui::Ui, cx: &Cx, id: egui::Id, hovered: bool, track: &TrackItem) {
+    const DWELL_SECS: f64 = 0.25;
+    let key = id.with("dwell");
+    let ctx = ui.ctx();
+    if !hovered {
+        ctx.data_mut(|d| d.remove_temp::<f64>(key));
+        return;
+    }
+    let now = ui.input(|i| i.time);
+    let started = ctx.data_mut(|d| *d.get_temp_mut_or(key, now));
+    if started < 0.0 {
+        return; // already prefetched during this hover
+    }
+    if now - started >= DWELL_SECS {
+        cx.vm.playback.prefetch(track);
+        ctx.data_mut(|d| d.insert_temp(key, -1.0));
+    } else {
+        ctx.request_repaint_after(std::time::Duration::from_millis(260));
+    }
+}
+
 /// Stable colour for an id, so the same playlist always gets the same tile.
 pub fn seed_color(id: &str) -> Color32 {
     let mut hash: u32 = 2_166_136_261;
@@ -124,6 +148,7 @@ pub fn track_card(ui: &mut egui::Ui, cx: &mut Cx, track: &TrackItem, width: f32)
     let height = width + 60.0;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     let h = hot(ui, resp.id, resp.hovered());
+    prefetch_on_dwell(ui, cx, resp.id, resp.hovered(), track);
     let painter = ui.painter();
     painter.rect_filled(rect, Rounding::same(RADIUS_LG), mix(SURFACE, SURFACE_HI, h));
 
@@ -216,6 +241,7 @@ fn track_row(
 ) {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
     let h = hot(ui, resp.id, resp.hovered());
+    prefetch_on_dwell(ui, cx, resp.id, resp.hovered(), track);
     let is_now = cx.is_now(&track.media_id);
     let painter = ui.painter();
 

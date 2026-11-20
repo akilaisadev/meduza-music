@@ -126,6 +126,16 @@ impl PlaybackManager {
         let playback_seq    = Arc::new(AtomicU64::new(0));
         let shutdown       = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Start mpv now rather than on the first click: its cold start would
+        // otherwise be added to the time-to-audio of the first track played.
+        {
+            let warm_proc = Arc::clone(&mpv_proc);
+            let small_buffer = lk!(settings).mpv_small_buffer();
+            thread::spawn(move || {
+                ensure_mpv_running(&warm_proc, small_buffer);
+            });
+        }
+
         // ── Background IPC poller (runs every 100 ms, handles gapless transitions & track-ended signalling) ──
         let state_bg    = Arc::clone(&state);
         let progress_bg = Arc::clone(&progress);
@@ -409,7 +419,7 @@ impl PlaybackManager {
         let current_track_c = Arc::clone(&self.current_track);
         let duration_c   = Arc::clone(&self.duration_secs);
 
-        meduza_core::workers::io().submit(move || {
+        std::thread::spawn(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
             let mut vid = video_id.clone();
@@ -467,7 +477,7 @@ impl PlaybackManager {
             }
 
             println!("[Playback] Resolving stream for '{}' ({})", play_title, vid);
-            let Some(url) = StreamResolver::get_audio_url(&vid, quality) else {
+            let Some(url) = StreamResolver::get_audio_url_now(&vid, quality) else {
                 if seq_c.load(Ordering::SeqCst) == seq {
                     *lk!(state_c) = PlaybackState::Error("yt-dlp: could not resolve stream URL".to_string());
                 }
@@ -677,7 +687,7 @@ impl PlaybackManager {
         let ended_c  = Arc::clone(&self.track_ended);
         let repeat_c = Arc::clone(&self.repeat_mode);
 
-        meduza_core::workers::io().submit(move || {
+        std::thread::spawn(move || {
             if seq_c.load(Ordering::SeqCst) != seq { return; }
 
             if !ensure_mpv_running(&mpv_proc, lk!(settings_c2).mpv_small_buffer()) {
@@ -702,7 +712,7 @@ impl PlaybackManager {
             let stream_url = if let Some(url) = cached_url {
                 println!("[Preloader] Instant load pre-resolved stream URL for '{}' ({})", title, video_id);
                 url
-            } else if let Some(url) = StreamResolver::get_audio_url(&video_id, quality) {
+            } else if let Some(url) = StreamResolver::get_audio_url_now(&video_id, quality) {
                 url
             } else {
                 if seq_c.load(Ordering::SeqCst) == seq {
@@ -1049,7 +1059,7 @@ impl PlaybackManager {
         let mpv_proc_spawn   = Arc::clone(&mpv_proc);
         let seq_spawn        = Arc::clone(&seq_arc);
 
-        meduza_core::workers::io().submit(move || {
+        std::thread::spawn(move || {
             if seq_spawn.load(Ordering::SeqCst) != seq { return; }
             if !ensure_mpv_running(&mpv_proc_spawn, lk!(settings_c_spawn).mpv_small_buffer()) {
                 if seq_spawn.load(Ordering::SeqCst) == seq {
@@ -1075,7 +1085,7 @@ impl PlaybackManager {
             } else if let Some(local_path) = lk!(ds_c_spawn).get_cached_file(&video_id) {
                 println!("[DataSaver] 0-Data local playback for auto advance: '{}'", title);
                 local_path
-            } else if let Some(url) = StreamResolver::get_audio_url(&video_id, quality) {
+            } else if let Some(url) = StreamResolver::get_audio_url_now(&video_id, quality) {
                 url
             } else {
                 if seq_spawn.load(Ordering::SeqCst) == seq {
@@ -1247,6 +1257,16 @@ impl PlaybackManager {
         *lk!(self.queue) = tracks.into_iter().map(|t| QueueItem { track: t }).collect();
         *lk!(self.queue_index) = start;
         self.play_now_without_queue_reset(first);
+    }
+
+    /// Resolve a track's stream URL ahead of time (e.g. when the cursor rests on
+    /// it), so playing it later is a cache hit instead of a yt-dlp run.
+    pub fn prefetch(&self, track: &TrackItem) {
+        if track.media_id.starts_with("PL:") || track.media_id.starts_with("BROWSE:") {
+            return;
+        }
+        let quality = lk!(self.settings).audio_quality;
+        StreamResolver::prefetch(&track.media_id, quality);
     }
 
     /// Jump to an entry of the current queue without rebuilding it.

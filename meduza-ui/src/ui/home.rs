@@ -82,6 +82,7 @@ fn quick_picks(ui: &mut egui::Ui, cx: &mut Cx, tracks: &[TrackItem]) {
 fn pick_tile(ui: &mut egui::Ui, cx: &mut Cx, track: &TrackItem, width: f32) {
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 60.0), Sense::click());
     let hot = ui.ctx().animate_bool(resp.id.with("hot"), resp.hovered());
+    widgets::prefetch_on_dwell(ui, cx, resp.id, resp.hovered(), track);
     ui.painter().rect_filled(
         rect,
         Rounding::same(RADIUS_MD),

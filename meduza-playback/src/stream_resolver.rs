@@ -26,6 +26,12 @@ static RESOLVE_SEM: Semaphore = Semaphore::new(3);
 const URL_CACHE_MAX: usize = 1024;
 const URL_CACHE_TTL: Duration = Duration::from_secs(4 * 3600);
 
+/// Cache keys with a resolve currently running (see `StreamResolver::prefetch`).
+fn in_flight() -> &'static Mutex<std::collections::HashSet<String>> {
+    static IN_FLIGHT: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    IN_FLIGHT.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
 fn get_url_cache() -> &'static Mutex<UrlCache> {
     URL_CACHE.get_or_init(|| Mutex::new(UrlCache {
         entries: HashMap::new(),
@@ -213,17 +219,60 @@ impl StreamResolver {
     /// Resolves a direct audio CDN URL for a given YouTube video ID using yt-dlp.
     /// Uses ultra-fast in-memory caching (~0.001s) and direct resolution (~0.4s).
     pub fn get_audio_url(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
+        if let Some(url) = Self::cached_for(video_id, quality) {
+            return Some(url);
+        }
+        // Background work (preloading, warm-ups) waits its turn behind the
+        // concurrency limit so it never slows down a track the user picked.
+        let _resolve_guard = RESOLVE_SEM.acquire();
+        Self::resolve_uncached(video_id, quality)
+    }
+
+    /// Like `get_audio_url`, but skips the concurrency limit. Used for the track
+    /// the user just picked, which must not queue behind background resolves.
+    pub fn get_audio_url_now(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
+        if let Some(url) = Self::cached_for(video_id, quality) {
+            return Some(url);
+        }
+        Self::resolve_uncached(video_id, quality)
+    }
+
+    /// Resolves `video_id` in the background so a later play is a cache hit.
+    /// Duplicate requests for the same track are coalesced.
+    pub fn prefetch(video_id: &str, quality: meduza_core::settings::AudioQuality) {
+        if video_id.len() != 11 || Self::cached_for(video_id, quality).is_some() {
+            return;
+        }
+        let key = format!("{}:{:?}", video_id, quality);
+        {
+            let mut inflight = in_flight().lock().unwrap_or_else(|e| e.into_inner());
+            if !inflight.insert(key.clone()) {
+                return;
+            }
+        }
+        let video_id = video_id.to_string();
+        thread::spawn(move || {
+            let _ = Self::get_audio_url(&video_id, quality);
+            in_flight().lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+        });
+    }
+
+    /// In-memory (or restored disk) cache lookup, validated for freshness.
+    fn cached_for(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
         // IMP-6: Ensure disk cache is loaded on first call this session
         if !DISK_CACHE_LOADED.load(std::sync::atomic::Ordering::SeqCst) {
             Self::load_cache_from_disk();
         }
-
         let cache_key = format!("{}:{:?}", video_id, quality);
-        if let Some(url) = cached_url(&cache_key) {
-            println!("[StreamResolver] 0.001s Cache Hit for {}", video_id);
-            return Some(url);
-        }
+        let url = cached_url(&cache_key)?;
+        println!("[StreamResolver] 0.001s Cache Hit for {}", video_id);
+        Some(url)
+    }
 
+    /// Runs yt-dlp for a track that is not cached. Callers hold any needed permit.
+    fn resolve_uncached(video_id: &str, quality: meduza_core::settings::AudioQuality) -> Option<String> {
+        let cache_key = format!("{}:{:?}", video_id, quality);
+        let started = Instant::now();
         let url = format!("https://www.youtube.com/watch?v={}", video_id);
 
         let format_arg = match quality {
@@ -231,9 +280,6 @@ impl StreamResolver {
             meduza_core::settings::AudioQuality::Normal    => "bestaudio[acodec=opus][abr<=128]/bestaudio[abr<=128]/bestaudio[ext=webm]",
             meduza_core::settings::AudioQuality::High      => "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
         };
-
-        // Bound concurrent yt-dlp processes (CPU overload guard).
-        let _resolve_guard = RESOLVE_SEM.acquire();
 
         // 1. FAST DIRECT RESOLUTION (~0.4s - 0.6s instant load!)
         let mut fast_cmd = Self::yt_dlp_cmd();
@@ -259,7 +305,12 @@ impl StreamResolver {
                     .trim()
                     .to_string();
                 if !stream_url.is_empty() {
-                    println!("[StreamResolver] Fast Resolved (0.5s): {} ({})", settings::redact_url(&stream_url), video_id);
+                    println!(
+                        "[StreamResolver] Resolved in {} ms: {} ({})",
+                        started.elapsed().as_millis(),
+                        settings::redact_url(&stream_url),
+                        video_id
+                    );
                     url_cache_insert(cache_key, (stream_url.clone(), Instant::now()));
                     return Some(stream_url);
                 }
