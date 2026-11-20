@@ -27,6 +27,8 @@ pub struct AppViewModel {
     /// Monotonically increasing counter bumped whenever any snapshot data changes.
     /// The UI thread compares this to its local copy to know when to re-clone.
     pub data_version: AtomicU64,
+    /// Guards against an older search completing after a newer one.
+    search_generation: AtomicU64,
 }
 
 impl AppViewModel {
@@ -48,6 +50,7 @@ impl AppViewModel {
             search_results: RwLock::new(Vec::new()),
             is_searching: AtomicBool::new(false),
             data_version: AtomicU64::new(0),
+            search_generation: AtomicU64::new(0),
         });
 
         // Start background updater thread
@@ -57,21 +60,30 @@ impl AppViewModel {
     }
 
     fn start_background_updater(self: &Arc<Self>) {
-        let vm = Arc::clone(self);
+        // Hold a Weak reference: an Arc here would keep AppViewModel (and
+        // therefore PlaybackManager) alive forever, so its Drop never ran and
+        // mpv was left orphaned on exit.
+        let vm = Arc::downgrade(self);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(500)); // Relaxed polling — data changes are rare
+                let Some(vm) = vm.upgrade() else { break; };
 
-                // Safely update queue snapshots
-                if let Ok(q) = vm.playback.queue.try_lock() {
-                    if let Ok(mut snap) = vm.queue_snapshot.write() {
+                // Only bump data_version when a snapshot actually changed.
+                // Bumping unconditionally forced the UI to deep-clone the
+                // entire feed/search results twice per second.
+                let mut changed = false;
+
+                if let (Ok(q), Ok(mut snap)) = (vm.playback.queue.try_lock(), vm.queue_snapshot.write()) {
+                    if *snap != *q {
                         *snap = q.clone();
+                        changed = true;
                     }
                 }
-                
-                if let Ok(idx) = vm.playback.queue_index.try_lock() {
-                    if let Ok(mut snap) = vm.queue_index_snapshot.write() {
+                if let (Ok(idx), Ok(mut snap)) = (vm.playback.queue_index.try_lock(), vm.queue_index_snapshot.write()) {
+                    if *snap != *idx {
                         *snap = *idx;
+                        changed = true;
                     }
                 }
 
@@ -83,14 +95,20 @@ impl AppViewModel {
                         let heavy = reco.get_heavy_rotation(8);
                         let unique_heavy = meduza_core::recommendation_engine::RecommendationEngine::filter_unique(&heavy, &mut seen);
                         if let Ok(mut snap) = vm.heavy_rotation_snapshot.write() {
-                            *snap = unique_heavy;
+                            if *snap != unique_heavy {
+                                *snap = unique_heavy;
+                                changed = true;
+                            }
                         }
                     }
 
                     if let Ok(history) = vm.playback.history.try_lock() {
                         let unique_hist = meduza_core::recommendation_engine::RecommendationEngine::filter_unique(&history, &mut seen);
                         if let Ok(mut snap) = vm.history_snapshot.write() {
-                            *snap = unique_hist;
+                            if *snap != unique_hist {
+                                *snap = unique_hist;
+                                changed = true;
+                            }
                         }
                     }
 
@@ -98,13 +116,17 @@ impl AppViewModel {
                         let mut liked_seen = HashSet::new();
                         let unique_liked = meduza_core::recommendation_engine::RecommendationEngine::filter_unique(&liked, &mut liked_seen);
                         if let Ok(mut snap) = vm.liked_songs_snapshot.write() {
-                            *snap = unique_liked;
+                            if *snap != unique_liked {
+                                *snap = unique_liked;
+                                changed = true;
+                            }
                         }
                     }
                 }
 
-                // Bump version so UI knows data changed
-                vm.data_version.fetch_add(1, Ordering::SeqCst);
+                if changed {
+                    vm.data_version.fetch_add(1, Ordering::SeqCst);
+                }
             }
         });
     }
@@ -132,7 +154,7 @@ impl AppViewModel {
             let mut top_artist = None;
             let mut top_tracks = Vec::new();
             
-            if let Ok(reco) = vm.playback.recommendation_engine.lock() {
+            if let Ok(reco) = vm.playback.recommendation_engine.try_lock() {
                 top_artist = reco.get_top_artist();
                 top_tracks = reco.get_heavy_rotation(10);
             }
@@ -164,7 +186,7 @@ impl AppViewModel {
                 }
             }
             
-            let feed_parallel = if let Ok(settings) = vm.playback.settings.lock() {
+            let feed_parallel = if let Ok(settings) = vm.playback.settings.try_lock() {
                 settings.home_feed_parallel()
             } else {
                 8
@@ -190,6 +212,7 @@ impl AppViewModel {
     }
 
     pub fn search(self: &Arc<Self>, query: String) {
+        let gen = self.search_generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.is_searching.store(true, Ordering::SeqCst);
         if let Ok(mut snap) = self.search_results.write() {
             snap.clear();
@@ -197,6 +220,10 @@ impl AppViewModel {
         let vm = Arc::clone(self);
         self.runtime.spawn(async move {
             let res = vm.innertube.search_tracks(&query).await;
+            // An older query may finish after a newer one — ignore stale data.
+            if vm.search_generation.load(Ordering::SeqCst) != gen {
+                return;
+            }
             if let Ok(mut snap) = vm.search_results.write() {
                 *snap = res;
             }

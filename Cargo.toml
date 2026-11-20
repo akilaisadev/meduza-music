@@ -23,8 +23,6 @@ image = { version = "0.24", default-features = false, features = ["jpeg", "png",
 dirs = "5.0"
 chrono = "0.4"
 url = "2.5"
-tray-icon = { version = "0.14", default-features = false }
-gtk = "0.18"
 
 meduza-core = { path = "meduza-core" }
 meduza-playback = { path = "meduza-playback" }

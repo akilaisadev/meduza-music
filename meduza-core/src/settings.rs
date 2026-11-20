@@ -114,6 +114,11 @@ pub fn ensure_private_dir(path: &Path) {
 
 /// Atomically write a private data file (0600), creating private parents.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    write_private_bytes(path, contents.as_bytes())
+}
+
+/// Binary-safe variant of `write_private` for cached images and other raw data.
+pub fn write_private_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     if let Some(parent) = path.parent() {
@@ -125,7 +130,7 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    f.write_all(contents.as_bytes())?;
+    f.write_all(contents)?;
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     Ok(())
 }
@@ -144,17 +149,21 @@ pub enum FetchMethod {
     Head,
 }
 
-fn url_host(url: &str) -> Option<&str> {
-    let after_scheme = url.split("://").nth(1)?;
-    let host = after_scheme.split(['/', '?']).next()?;
-    let host = host.split(':').next()?;
-    if host.is_empty() { None } else { Some(host) }
+fn url_host(url: &str) -> Option<String> {
+    // Use a real URL parser: naive string splitting treats the part before a
+    // ':' as the host, so `https://ytimg.com:443@evil.com/` was incorrectly
+    // considered allowlisted even though it connects to evil.com.
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() { None } else { Some(host.to_ascii_lowercase()) }
 }
 
 /// True if the URL points at a host the app is allowed to fetch from.
 pub fn host_is_allowed(url: &str, kind: UrlKind) -> bool {
     let Some(host) = url_host(url) else { return false; };
-    let host = host.to_ascii_lowercase();
     let allowed: &[&str] = match kind {
         UrlKind::Image => &[
             "ytimg.com",
@@ -190,7 +199,7 @@ pub fn fetch_allowed(
     let mut current = url.to_string();
     for _ in 0..6 {
         if !host_is_allowed(&current, kind) {
-            return Err(format!("host not allowlisted: {}", url_host(&current).unwrap_or("?")));
+            return Err(format!("host not allowlisted: {}", url_host(&current).unwrap_or_else(|| "?".to_string())));
         }
 
         let req = match method {
@@ -200,8 +209,14 @@ pub fn fetch_allowed(
         let resp = req.timeout(timeout).call().map_err(|e| e.to_string())?;
 
         let code = resp.status();
-        if !(300..400).contains(&code) {
+        // Only successful responses are usable. Treating 404/500 as success
+        // caused error pages to be cached as album art and permanently hid
+        // affected tracks from the UI.
+        if (200..300).contains(&code) {
             return Ok(resp);
+        }
+        if !(300..400).contains(&code) {
+            return Err(format!("HTTP {}", code));
         }
         let Some(loc) = resp.header("Location") else {
             return Err("redirect without Location header".to_string());
@@ -295,10 +310,11 @@ impl AppSettings {
 // default the user can flip with a single checkbox.
 
 impl AppSettings {
-    /// Now-playing repaint cadence (ms/frame): 30 fps on low-end, 60 fps
-    /// otherwise. The 10 fps navigation cadence is unaffected.
+    /// Repaint cadence for progress/auto-advance polling, in milliseconds.
+    /// 10 fps normally, 5 fps on low-end hardware; enough for a smooth
+    /// progress bar without the 60 fps repaint storm of earlier builds.
     pub fn now_playing_frame_ms(&self) -> u64 {
-        if self.low_end_mode { 33 } else { 16 }
+        if self.low_end_mode { 200 } else { 100 }
     }
 
     /// Layered glowing ambient-ink background behind the now-playing vinyl.

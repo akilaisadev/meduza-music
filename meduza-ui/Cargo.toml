@@ -12,8 +12,4 @@ eframe.workspace = true
 tokio.workspace = true
 image.workspace = true
 chrono.workspace = true
-tray-icon.workspace = true
 serde_json.workspace = true
-
-[target.'cfg(target_os = "linux")'.dependencies]
-gtk.workspace = true

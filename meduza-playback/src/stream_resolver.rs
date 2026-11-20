@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::thread;
@@ -45,10 +45,28 @@ fn cache_file_path() -> PathBuf {
 pub struct StreamResolver;
 
 impl StreamResolver {
+    /// Prefer a standalone `yt-dlp` executable (used by the Flatpak build) and
+    /// fall back to the Python module for source/AppImage installs. Detection
+    /// is cached so we do not spawn a `--version` process on every resolve.
     fn yt_dlp_cmd() -> Command {
-        let mut cmd = Command::new("python3");
-        cmd.args(["-m", "yt_dlp"]);
-        cmd
+        static USE_BINARY: OnceLock<bool> = OnceLock::new();
+        let use_binary = *USE_BINARY.get_or_init(|| {
+            Command::new("yt-dlp")
+                .arg("--version")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        });
+        if use_binary {
+            Command::new("yt-dlp")
+        } else {
+            let mut cmd = Command::new("python3");
+            cmd.args(["-m", "yt_dlp"]);
+            cmd
+        }
     }
 
     /// IMP-6: Load persisted URL cache from disk on first call.

@@ -14,7 +14,7 @@ const API_KEY: &str = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30";
 
 // ── Data models ──────────────────────────────────────────────────────────────
 
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct TrackItem {
     pub title: String,
     pub artist: String,

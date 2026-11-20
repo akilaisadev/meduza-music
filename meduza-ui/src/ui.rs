@@ -207,10 +207,11 @@ impl MeduzaApp {
             ) {
                 let mut buf = Vec::new();
                 if resp.into_reader().take(5 * 1024 * 1024).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
-                    meduza_core::settings::ensure_private_dir(&cache_file);
-                    let _ = std::fs::write(&cache_file, &buf);
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = std::fs::set_permissions(&cache_file, std::fs::Permissions::from_mode(0o600));
+                    // cache_file is a FILE path — never pass it to
+                    // ensure_private_dir (that would create a directory and
+                    // make the write below fail silently). The parent dir is
+                    // already private; write_private enforces 0600 on the file.
+                    let _ = meduza_core::settings::write_private_bytes(&cache_file, &buf);
                     raw = Some(buf);
                 }
             }

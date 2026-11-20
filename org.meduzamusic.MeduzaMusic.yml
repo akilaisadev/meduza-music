@@ -12,6 +12,7 @@ finish-args:
   - --socket=wayland
   - --device=dri
   - --socket=pulseaudio
+  - --socket=session-bus
   - --talk-name=org.freedesktop.Notifications
 build-options:
   build-args:
@@ -28,16 +29,23 @@ modules:
   - name: mpv
     buildsystem: simple
     build-commands:
-      # Use an AppImage or static build of mpv for simplicity in this local flatpak
-      - wget https://github.com/ivan-hc/MPV-appimage/releases/download/continuous/mpv-Media-Player_0.41.0-3-archimage5.0-x86_64.AppImage -O mpv
-      - chmod +x mpv
-      - install -D -m 755 mpv /app/bin/mpv
+      # Extract the AppImage at BUILD time: FUSE is not available inside the
+      # Flatpak sandbox, and AppRun sets up its own LD_LIBRARY_PATH after
+      # PlaybackManager strips inherited library paths.
+      - wget https://github.com/ivan-hc/MPV-appimage/releases/download/continuous/mpv-Media-Player_0.41.0-3-archimage5.0-x86_64.AppImage -O mpv.AppImage
+      - chmod +x mpv.AppImage
+      - ./mpv.AppImage --appimage-extract
+      - install -d /app/lib/mpv
+      - cp -a squashfs-root/. /app/lib/mpv/
+      - printf '#!/bin/sh\nexec /app/lib/mpv/AppRun "$@"\n' > mpv-wrapper
+      - install -D -m 755 mpv-wrapper /app/bin/mpv
   - name: meduza-music
     buildsystem: simple
     build-commands:
       - cargo build --release
       - install -D -m 755 target/release/meduza-ui /app/bin/meduza-music
       - install -D -m 644 org.meduzamusic.MeduzaMusic.desktop /app/share/applications/org.meduzamusic.MeduzaMusic.desktop
+      - install -D -m 644 org.meduzamusic.MeduzaMusic.metainfo.xml /app/share/metainfo/org.meduzamusic.MeduzaMusic.metainfo.xml
       - install -D -m 644 logo.png /app/share/icons/hicolor/512x512/apps/org.meduzamusic.MeduzaMusic.png
     sources:
       - type: dir

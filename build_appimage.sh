@@ -2,6 +2,9 @@
 set -e
 
 APP_NAME="MeduzaMusic"
+# The workspace crate is `meduza-ui`; the installed binary is renamed to
+# `meduza-music` inside the AppDir to match the desktop file.
+BUILD_BINARY="meduza-ui"
 EXEC_NAME="meduza-music"
 VERSION="1.2.0"
 
@@ -26,11 +29,13 @@ echo "Compiling Rust binary..."
 cargo build --release
 
 # Copy binary and strip it to make the AppImage as small as possible
-cp "target/release/$EXEC_NAME" "$APPDIR/usr/bin/"
+cp "target/release/$BUILD_BINARY" "$APPDIR/usr/bin/$EXEC_NAME"
 strip "$APPDIR/usr/bin/$EXEC_NAME"
 
 # Copy desktop file and icon
 cp "org.meduzamusic.MeduzaMusic.desktop" "$APPDIR/usr/share/applications/"
+mkdir -p "$APPDIR/usr/share/metainfo"
+cp "org.meduzamusic.MeduzaMusic.metainfo.xml" "$APPDIR/usr/share/metainfo/"
 cp "logo.png" "$APPDIR/usr/share/icons/hicolor/512x512/apps/org.meduzamusic.MeduzaMusic.png"
 
 # Set version
