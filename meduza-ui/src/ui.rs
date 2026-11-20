@@ -45,6 +45,9 @@ pub struct MeduzaApp {
     logo_texture: Option<egui::TextureHandle>,
 
     show_now_playing: bool,
+    /// Issue #7: lyrics panel toggle + auto-scroll tracking.
+    show_lyrics: bool,
+    last_lyric_index: Option<usize>,
 
     // ── Cached snapshots (avoids cloning from RwLock every frame) ────────
     last_data_version: u64,
@@ -154,6 +157,8 @@ impl MeduzaApp {
             image_rgba:      Arc::new(Mutex::new(HashMap::new())),
             logo_texture,
             show_now_playing: false,
+            show_lyrics: false,
+            last_lyric_index: None,
             last_data_version: u64::MAX, // force first-frame refresh
             cached_sections:   Vec::new(),
             cached_search:     Vec::new(),
@@ -1207,7 +1212,25 @@ impl MeduzaApp {
                     RichText::new(vol_icon).color(T_SEC).font(FontId::proportional(15.0))
                 ).frame(false);
                 
-                if ui.add(vol_btn).on_hover_text(if vol == 0.0 { "Unmute" } else { "Mute" }).clicked() {
+                let vol_resp = ui.add(vol_btn).on_hover_text(
+                    if vol == 0.0 { "Unmute · scroll to adjust ±5%" } else { "Mute · scroll to adjust ±5%" }
+                );
+
+                // Scroll over the speaker icon adjusts volume in 5% steps.
+                if vol_resp.hovered() {
+                    let scroll = ui.input(|i| i.raw_scroll_delta.y + i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.01 {
+                        let delta = if scroll > 0.0 { 5.0 } else { -5.0 };
+                        self.viewmodel.playback.set_volume((vol + delta).clamp(0.0, 100.0));
+                        // Consume the delta so the surrounding panel does not scroll.
+                        ui.input_mut(|i| {
+                            i.raw_scroll_delta = Vec2::ZERO;
+                            i.smooth_scroll_delta = Vec2::ZERO;
+                        });
+                    }
+                }
+
+                if vol_resp.clicked() {
                     if vol > 0.0 {
                         self.viewmodel.playback.set_volume(0.0);
                     } else {
@@ -1277,6 +1300,17 @@ impl MeduzaApp {
                     "Pre-resolves upcoming track stream URLs in background.",
                     &mut settings.preload_next_track,
                 ) { changed = true; }
+                ui.add_space(6.0);
+
+                // Issue #10 — how many upcoming tracks to pre-resolve.
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Preload buffer:").color(T_SEC).font(FontId::proportional(13.0)));
+                    for n in [1usize, 2, 3, 5] {
+                        if ui.selectable_value(&mut settings.preload_buffer_tracks, n, format!("{} track{}", n, if n > 1 { "s" } else { "" })).clicked() {
+                            changed = true;
+                        }
+                    }
+                });
                 ui.add_space(8.0);
 
                 if Self::render_setting_toggle_card(
@@ -1522,6 +1556,23 @@ impl MeduzaApp {
                     T_DIM,
                 );
 
+                // ── Lyrics toggle (issue #7) ──────────────────────────────────────
+                let lyrics_btn_r = egui::Rect::from_min_size(
+                    egui::pos2(rect.max.x - 110.0, rect.min.y + 16.0),
+                    Vec2::new(90.0, 36.0),
+                );
+                if ui.put(lyrics_btn_r, egui::Button::new(
+                    RichText::new(if self.show_lyrics { "♫ Lyrics" } else { "♫ Lyrics" })
+                        .font(FontId::proportional(12.0))
+                        .color(if self.show_lyrics { ACCENT } else { T_SEC })
+                ).fill(Color32::from_rgb(34, 34, 40)).rounding(Rounding::same(8.0)))
+                    .on_hover_text("Toggle synchronized lyrics")
+                    .clicked()
+                {
+                    self.show_lyrics = !self.show_lyrics;
+                    self.last_lyric_index = None;
+                }
+
                 // ── 4. Main Stage (Massive Dynamic Album Art) ──────────────────────
                 let transport_y = rect.max.y - (h * 0.22).clamp(160.0, 300.0);
                 let img_center_y = rect.min.y + 50.0 + (transport_y - (rect.min.y + 50.0)) / 2.0;
@@ -1553,6 +1604,59 @@ impl MeduzaApp {
                     ui.painter().text(
                         img_rect.center(), egui::Align2::CENTER_CENTER, "♪", FontId::proportional(img_size * 0.2), T_DIM
                     );
+                }
+
+                // ── Synchronized lyrics panel (issue #7) ─────────────────────────
+                if self.show_lyrics {
+                    let panel_w = 320.0_f32;
+                    let panel_rect = egui::Rect::from_min_max(
+                        egui::pos2(rect.max.x - panel_w - 24.0, rect.min.y + 66.0),
+                        egui::pos2(rect.max.x - 24.0, transport_y - 16.0),
+                    );
+                    ui.painter().rect_filled(panel_rect, Rounding::same(12.0), Color32::from_rgba_unmultiplied(30, 30, 34, 230));
+
+                    let lyrics = self.viewmodel.lyrics.read().map(|l| l.clone()).unwrap_or_default();
+                    let active = lyrics.active_index(pos);
+                    let should_scroll = active != self.last_lyric_index;
+                    self.last_lyric_index = active;
+
+                    ui.allocate_ui_at_rect(panel_rect.shrink(14.0), |ui| {
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("LYRICS").color(T_DIM).font(FontId::proportional(11.0)).strong());
+                                if !lyrics.source.is_empty() {
+                                    ui.label(RichText::new(format!("· {}", lyrics.source)).color(T_DIM).font(FontId::proportional(10.0)));
+                                }
+                            });
+                            ui.separator();
+                            egui::ScrollArea::vertical()
+                                .id_source("lyrics_scroll")
+                                .show(ui, |ui| {
+                                    if !lyrics.lines.is_empty() {
+                                        for (i, line) in lyrics.lines.iter().enumerate() {
+                                            let is_active = active == Some(i);
+                                            let color = if is_active { ACCENT } else if active.map_or(false, |a| i < a) { T_DIM } else { T_SEC };
+                                            let label = ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&line.text)
+                                                        .font(FontId::proportional(if is_active { 16.0 } else { 14.0 }))
+                                                        .color(color)
+                                                ).wrap(true)
+                                            );
+                                            if is_active && should_scroll {
+                                                // Keep the active line in view as playback progresses.
+                                                ui.scroll_to_rect(label.rect, Some(egui::Align::Center));
+                                            }
+                                            ui.add_space(8.0);
+                                        }
+                                    } else if let Some(ref plain) = lyrics.plain {
+                                        ui.label(RichText::new(plain).color(T_SEC).font(FontId::proportional(14.0)));
+                                    } else {
+                                        ui.label(RichText::new("No lyrics available for this track.").color(T_DIM).font(FontId::proportional(13.0)));
+                                    }
+                                });
+                        });
+                    });
                 }
 
                 // ── 4. Bottom Transport Hub (Spotify Style) ────────────────────────
@@ -1854,6 +1958,11 @@ impl eframe::App for MeduzaApp {
             } else {
                 self.pending_suggest = Some(q);
             }
+        }
+
+        // Kick off lyrics fetch for the current track (no-op if unchanged).
+        if let Some(t) = self.viewmodel.playback.current_track.try_lock().ok().and_then(|g| g.clone()) {
+            self.viewmodel.ensure_lyrics(t);
         }
 
         // Handle auto advance

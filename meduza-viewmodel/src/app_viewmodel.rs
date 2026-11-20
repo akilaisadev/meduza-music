@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use meduza_core::innertube::{BrowseSection, InnerTubeClient, TrackItem};
+use meduza_core::lyrics::Lyrics;
 use meduza_playback::playback_manager::{PlaybackManager, QueueItem};
 use std::collections::HashSet;
 
@@ -29,6 +30,12 @@ pub struct AppViewModel {
     pub data_version: AtomicU64,
     /// Guards against an older search completing after a newer one.
     search_generation: AtomicU64,
+
+    // Lyrics for the current track (issue #7)
+    pub lyrics: RwLock<Lyrics>,
+    pub lyrics_track_id: RwLock<Option<String>>,
+    lyrics_loading: AtomicBool,
+    lyrics_generation: AtomicU64,
 }
 
 impl AppViewModel {
@@ -51,6 +58,10 @@ impl AppViewModel {
             is_searching: AtomicBool::new(false),
             data_version: AtomicU64::new(0),
             search_generation: AtomicU64::new(0),
+            lyrics: RwLock::new(Lyrics::default()),
+            lyrics_track_id: RwLock::new(None),
+            lyrics_loading: AtomicBool::new(false),
+            lyrics_generation: AtomicU64::new(0),
         });
 
         // Start background updater thread
@@ -228,6 +239,39 @@ impl AppViewModel {
                 *snap = res;
             }
             vm.is_searching.store(false, Ordering::SeqCst);
+            vm.data_version.fetch_add(1, Ordering::SeqCst);
+        });
+    }
+
+    /// Fetch lyrics for `track` in the background, unless they are already
+    /// loaded or being fetched. Stale responses are discarded.
+    pub fn ensure_lyrics(self: &Arc<Self>, track: TrackItem) {
+        if let Ok(id) = self.lyrics_track_id.read() {
+            if id.as_deref() == Some(track.media_id.as_str()) {
+                return;
+            }
+        }
+        if self.lyrics_loading.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let gen = self.lyrics_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        if let Ok(mut id) = self.lyrics_track_id.write() {
+            *id = Some(track.media_id.clone());
+        }
+        if let Ok(mut l) = self.lyrics.write() {
+            *l = Lyrics::default();
+        }
+
+        let vm = Arc::clone(self);
+        meduza_core::workers::download().submit(move || {
+            let result = meduza_core::lyrics::fetch_lyrics(&track);
+            if vm.lyrics_generation.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if let Ok(mut l) = vm.lyrics.write() {
+                *l = result.unwrap_or_default();
+            }
+            vm.lyrics_loading.store(false, Ordering::SeqCst);
             vm.data_version.fetch_add(1, Ordering::SeqCst);
         });
     }

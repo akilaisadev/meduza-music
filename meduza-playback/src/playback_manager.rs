@@ -711,6 +711,24 @@ impl PlaybackManager {
             Arc::clone(&self.repeat_mode),
             current_track,
         );
+
+        // Issue #10: resolve additional upcoming tracks into the URL cache.
+        // Track idx+1 is handled by preload_next_in_bg above; this warms
+        // idx+2 .. idx+buffer_tracks so skips stay instant further ahead.
+        let (enabled, buffer, quality) = {
+            let Ok(s) = self.settings.try_lock() else { return; };
+            (s.preload_next_track, s.preload_buffer_tracks, s.audio_quality)
+        };
+        if !enabled || buffer <= 1 { return; }
+        let upcoming: Vec<String> = {
+            let (Ok(q), Ok(idx)) = (self.queue.try_lock(), self.queue_index.try_lock()) else { return; };
+            let start = idx.saturating_add(2);
+            (start..start + buffer - 1)
+                .filter_map(|i| q.get(i))
+                .map(|item| item.track.media_id.clone())
+                .collect()
+        };
+        Self::warm_url_cache_in_bg(upcoming, quality);
     }
 
     pub fn preload_next_in_bg(

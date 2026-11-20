@@ -12,6 +12,8 @@ pub enum AudioQuality {
     High,
 }
 
+fn default_preload_buffer() -> usize { 1 }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     pub audio_quality: AudioQuality,
@@ -19,6 +21,11 @@ pub struct AppSettings {
     pub gapless_playback: bool,
     pub autoplay_radio: bool,
     pub preload_next_track: bool,
+    /// How many upcoming queue tracks the background preloader resolves ahead.
+    /// 1 = only the next track (classic behaviour).
+    #[serde(default = "default_preload_buffer")]
+    pub preload_buffer_tracks: usize,
+    #[serde(default)]
     pub normalize_volume: bool,
     pub low_end_mode: bool,
     pub max_cache_size_mb: u64,
@@ -32,6 +39,7 @@ impl Default for AppSettings {
             gapless_playback: true,
             autoplay_radio: true,
             preload_next_track: true,
+            preload_buffer_tracks: 1,
             normalize_volume: true,
             low_end_mode: false,
             max_cache_size_mb: 500,
@@ -141,6 +149,8 @@ pub fn write_private_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
 pub enum UrlKind {
     Image,
     Stream,
+    /// Public metadata APIs (currently the LRCLIB lyrics service).
+    Api,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +183,7 @@ pub fn host_is_allowed(url: &str, kind: UrlKind) -> bool {
             "googlevideo.com",
         ],
         UrlKind::Stream => &["googlevideo.com", "youtube.com", "ytimg.com"],
+        UrlKind::Api => &["lrclib.net"],
     };
     allowed.iter().any(|s| host == *s || host.ends_with(&format!(".{}", s)))
 }
