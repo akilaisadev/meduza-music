@@ -2145,6 +2145,16 @@ fn fmt_time(secs: u32) -> String {
 impl eframe::App for MeduzaApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
 
+        // egui 0.26 feeds trackpad pinch and Ctrl+scroll into `zoom_delta` but
+        // does not apply it to the global zoom factor automatically. Keep the
+        // default at 1.0 (icons/text at their designed size) and let the user
+        // pinch to scale; Ctrl+0 resets to the default.
+        let zoom_delta = ctx.input(|i| i.zoom_delta());
+        if (zoom_delta - 1.0).abs() > 0.001 {
+            let next = (ctx.zoom_factor() * zoom_delta).clamp(0.65, 2.0);
+            ctx.set_zoom_factor(next);
+        }
+
         // Debounced suggestion fetch: only start a request 180 ms after the
         // last keystroke, and ignore any response from a superseded query.
         if let Some(q) = self.pending_suggest.take() {
