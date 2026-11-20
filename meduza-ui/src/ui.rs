@@ -7,17 +7,7 @@ use std::time::{Duration, Instant};
 use meduza_core::innertube::TrackItem;
 use meduza_playback::playback_manager::PlaybackState;
 
-// ── Palette ──────────────────────────────────────────────────────────────────
-const BG:         Color32 = Color32::from_rgb(10, 10, 10);
-const BG_SIDE:    Color32 = Color32::from_rgb(16, 16, 16);
-const BG_TOP:     Color32 = Color32::from_rgb(14, 14, 14);
-const BG_CARD:    Color32 = Color32::from_rgb(22, 22, 22);
-const BG_CARD_HV: Color32 = Color32::from_rgb(32, 32, 32);
-const ACCENT:     Color32 = Color32::from_rgb(29, 185, 84);
-
-const T_PRI:      Color32 = Color32::from_rgb(255, 255, 255);
-const T_SEC:      Color32 = Color32::from_rgb(170, 170, 170);
-const T_DIM:      Color32 = Color32::from_rgb(90, 90, 90);
+use crate::theme::*;
 
 
 #[derive(Clone, PartialEq)]
@@ -27,6 +17,8 @@ pub struct MeduzaApp {
     viewmodel: Arc<meduza_viewmodel::app_viewmodel::AppViewModel>,
 
     tab: Tab,
+    /// Sidebar can collapse to an icon rail to give content more room.
+    sidebar_expanded: bool,
 
     // Search
     search_query:   String,
@@ -152,6 +144,7 @@ impl MeduzaApp {
         Self {
             viewmodel,
             tab: Tab::Home,
+            sidebar_expanded: true,
             search_query: String::new(),
             last_search:  String::new(),
             suggestions:    Arc::new(Mutex::new(Vec::new())),
@@ -375,27 +368,47 @@ impl MeduzaApp {
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         let h = ui.available_height();
-        egui::Frame::none().fill(BG_SIDE).show(ui, |ui| {
-            ui.set_min_size(Vec2::new(200.0, h));
-            ui.add_space(20.0);
+        let full = self.sidebar_expanded;
+        let width = if full { SIDEBAR_FULL } else { SIDEBAR_RAIL };
 
-            // Logo
+        egui::Frame::none().fill(BG_SIDE).show(ui, |ui| {
+            ui.set_min_size(Vec2::new(width, h));
+            ui.add_space(18.0);
+
+            // Logo + collapse toggle
             ui.horizontal(|ui| {
-                ui.add_space(16.0);
+                ui.add_space(14.0);
                 if let Some(ref tex) = self.logo_texture {
                     ui.add(egui::Image::new(tex)
                         .fit_to_exact_size(Vec2::splat(28.0))
-                        .rounding(Rounding::same(6.0)));
+                        .rounding(Rounding::same(RADIUS_SM)));
                 } else {
                     ui.label(RichText::new("♪").color(ACCENT).font(FontId::proportional(26.0)));
                 }
-                ui.add_space(8.0);
-                ui.label(RichText::new("Meduza").color(T_PRI)
-                    .font(FontId::proportional(20.0)).strong());
+                if full {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Meduza").color(T_PRI)
+                        .font(FontId::proportional(20.0)).strong());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let toggle = egui::Button::new(
+                            RichText::new("‹").color(T_SEC).font(FontId::proportional(18.0))
+                        ).frame(false);
+                        if ui.add(toggle).on_hover_text("Collapse sidebar").clicked() {
+                            self.sidebar_expanded = false;
+                        }
+                    });
+                } else {
+                    let toggle = egui::Button::new(
+                        RichText::new("›").color(T_SEC).font(FontId::proportional(18.0))
+                    ).frame(false);
+                    if ui.add(toggle).on_hover_text("Expand sidebar").clicked() {
+                        self.sidebar_expanded = true;
+                    }
+                }
             });
-            ui.add_space(28.0);
+            ui.add_space(24.0);
 
-            // Nav items
+            // Nav items — active item gets a subtle raised pill and accent icon.
             for (icon, label, tgt) in [
                 ("🏠", "Home",         Tab::Home),
                 ("🔍", "Search",       Tab::Search),
@@ -405,73 +418,85 @@ impl MeduzaApp {
                 let active = self.tab == tgt;
                 let fg = if active { T_PRI } else { T_SEC };
                 let frame = egui::Frame::none()
-                    .fill(if active { Color32::from_rgb(28, 28, 28) } else { Color32::TRANSPARENT })
-                    .rounding(Rounding::same(8.0))
-                    .inner_margin(egui::Margin::symmetric(12.0, 8.0));
+                    .fill(if active { SURFACE_HOVER } else { Color32::TRANSPARENT })
+                    .rounding(Rounding::same(RADIUS_MD))
+                    .inner_margin(egui::Margin::symmetric(if full { 12.0 } else { 10.0 }, 8.0));
                 let resp = frame.show(ui, |ui| {
-                    ui.set_min_width(172.0);
+                    ui.set_min_width(if full { 172.0 } else { 36.0 });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(icon)
                             .font(FontId::proportional(15.0))
                             .color(if active { ACCENT } else { T_DIM }));
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(label)
-                            .font(FontId::proportional(14.0))
-                            .color(fg));
+                        if full {
+                            ui.add_space(8.0);
+                            ui.label(RichText::new(label)
+                                .font(FontId::proportional(14.0))
+                                .color(fg));
+                        }
                     });
                 }).response;
-                if resp.interact(Sense::click()).clicked() { self.tab = tgt; }
-                ui.add_space(4.0);
+                let resp = resp.interact(Sense::click());
+                if resp.clicked() { self.tab = tgt; }
+                if !full { resp.on_hover_text(label); }
+                ui.add_space(SPACE_SM / 2.0);
             }
 
-            ui.add_space(20.0);
-            ui.add(egui::Separator::default().shrink(16.0));
-            ui.add_space(12.0);
+            if full {
+                ui.add_space(SPACE_LG);
+                ui.add(egui::Separator::default().shrink(16.0));
+                ui.add_space(SPACE_MD);
 
-            // Queue preview wrapped in dedicated ScrollArea
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .id_source("sidebar_queue")
-                .show(ui, |ui| {
-                    let queue_opt = self.viewmodel.queue_snapshot.try_read();
-                    let idx_opt   = self.viewmodel.queue_index_snapshot.try_read();
-                    if let (Ok(queue), Ok(idx_g)) = (queue_opt, idx_opt) {
-                        let idx = *idx_g;
-                        if !queue.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(16.0);
-                            ui.label(RichText::new("UP NEXT").color(T_DIM)
-                                .font(FontId::proportional(10.0)));
-                        });
-                        ui.add_space(6.0);
-                        for (i, item) in queue.iter().skip(idx).take(15).enumerate() {
-                            let col = if i == 0 { ACCENT } else { T_SEC };
-                            let nm  = if item.track.title.is_empty() { "—" } else { &item.track.title };
-                            let (rect, resp) = ui.allocate_exact_size(Vec2::new(172.0, 24.0), Sense::click());
-                            let clip_rect = egui::Rect::from_min_max(
-                                rect.min + egui::vec2(16.0, 0.0),
-                                rect.max - egui::vec2(8.0, 0.0),
-                            );
-                            let prefix = if i == 0 { "▶ " } else { "" };
-                            let display_txt = format!("{}{}", prefix, trunc(nm, 18));
-                            ui.painter().with_clip_rect(clip_rect).text(
-                                rect.min + egui::vec2(16.0, 4.0),
-                                egui::Align2::LEFT_TOP,
-                                display_txt,
-                                FontId::proportional(11.5),
-                                col,
-                            );
-                            if resp.clicked() {
-                                self.viewmodel.playback.play_now(item.track.clone());
+                // Queue preview wrapped in dedicated ScrollArea
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .id_source("sidebar_queue")
+                    .show(ui, |ui| {
+                        let queue_opt = self.viewmodel.queue_snapshot.try_read();
+                        let idx_opt   = self.viewmodel.queue_index_snapshot.try_read();
+                        if let (Ok(queue), Ok(idx_g)) = (queue_opt, idx_opt) {
+                            let idx = *idx_g;
+                            if !queue.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(16.0);
+                                    ui.label(RichText::new("UP NEXT").color(T_DIM)
+                                        .font(FontId::proportional(10.0)));
+                                });
+                                ui.add_space(6.0);
+                                for (i, item) in queue.iter().skip(idx).take(15).enumerate() {
+                                    let col = if i == 0 { ACCENT } else { T_SEC };
+                                    let nm  = if item.track.title.is_empty() { "—" } else { &item.track.title };
+                                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(172.0, 24.0), Sense::click());
+                                    let clip_rect = egui::Rect::from_min_max(
+                                        rect.min + egui::vec2(16.0, 0.0),
+                                        rect.max - egui::vec2(8.0, 0.0),
+                                    );
+                                    let prefix = if i == 0 { "▶ " } else { "" };
+                                    let display_txt = format!("{}{}", prefix, trunc(nm, 18));
+                                    ui.painter().with_clip_rect(clip_rect).text(
+                                        rect.min + egui::vec2(16.0, 4.0),
+                                        egui::Align2::LEFT_TOP,
+                                        display_txt,
+                                        FontId::proportional(11.5),
+                                        col,
+                                    );
+                                    if resp.clicked() {
+                                        self.viewmodel.playback.play_now(item.track.clone());
+                                    }
+                                }
                             }
                         }
-                    }
-                    }
-                });
+                    });
+            }
         });
     }
 
     fn topbar(&mut self, ui: &mut egui::Ui) {
+        // Ctrl+K jumps to the full search field from anywhere in the app.
+        if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
+            self.tab = Tab::Search;
+            ui.memory_mut(|m| m.request_focus(egui::Id::new("main_search")));
+        }
+
         egui::Frame::none()
             .fill(BG_TOP)
             .stroke(Stroke::new(1.0_f32, Color32::from_rgb(28, 28, 28)))
@@ -499,9 +524,9 @@ impl MeduzaApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.tab != Tab::Search {
                             egui::Frame::none()
-                                .fill(Color32::from_rgb(30, 30, 30))
-                                .rounding(Rounding::same(16.0))
-                                .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                                .fill(SURFACE_RAISED)
+                                .rounding(Rounding::same(RADIUS_PILL))
+                                .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new("🔍").color(T_DIM)
@@ -509,10 +534,10 @@ impl MeduzaApp {
                                         ui.add_space(4.0);
                                         let resp = ui.add(
                                             egui::TextEdit::singleline(&mut self.search_query)
-                                                .hint_text("Quick search…")
+                                                .hint_text("Search…   Ctrl K")
                                                 .font(FontId::proportional(13.0))
                                                 .frame(false)
-                                                .desired_width(160.0),
+                                                .desired_width(200.0),
                                         );
                                         if resp.lost_focus()
                                             && ui.input(|i| i.key_pressed(egui::Key::Enter))
@@ -691,6 +716,17 @@ impl MeduzaApp {
             );
         }
 
+        // Play affordance — appears on hover so cards stay calm at rest.
+        if response.hovered() {
+            let r = 18.0_f32;
+            let center = img_rect.max - egui::vec2(r + 6.0, r + 6.0);
+            ui.painter().circle_filled(center, r, ACCENT);
+            ui.painter().text(
+                center, egui::Align2::CENTER_CENTER, "▶",
+                FontId::proportional(15.0), Color32::BLACK,
+            );
+        }
+
         // Text Clip
         let card_clip = egui::Rect::from_min_max(
             rect.min + egui::vec2(pad, 0.0),
@@ -757,6 +793,7 @@ impl MeduzaApp {
                     ui.add_space(10.0);
                     let resp = ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
+                            .id_source("main_search")
                             .hint_text("Artists, songs, albums…")
                             .font(FontId::proportional(16.0))
                             .frame(false)
@@ -813,6 +850,25 @@ impl MeduzaApp {
         ui.add_space(8.0);
 
         let is_searching = self.viewmodel.is_searching.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Recent search chip — quick way back to the last query.
+        if !is_searching && !self.last_search.is_empty() {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Recent").color(T_DIM).font(FontId::proportional(11.0)));
+                ui.add_space(SPACE_SM);
+                let chip = egui::Button::new(
+                    RichText::new(format!("  {}  ", trunc(&self.last_search, 28)))
+                        .color(T_SEC).font(FontId::proportional(12.0)),
+                ).fill(SURFACE_RAISED).rounding(Rounding::same(RADIUS_PILL));
+                if ui.add(chip).on_hover_text("Search again").clicked() {
+                    let q = self.last_search.clone();
+                    self.search_query = q.clone();
+                    self.viewmodel.search(q);
+                }
+            });
+            ui.add_space(SPACE_MD);
+        }
+
         if is_searching {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -1458,6 +1514,26 @@ impl MeduzaApp {
                 );
                 ui.add_space(16.0);
 
+                // ── 0. Appearance ────────────────────────────────────────────
+                ui.label(RichText::new("Appearance").color(T_PRI)
+                    .font(FontId::proportional(16.0)).strong());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.sidebar_expanded, "Expanded sidebar");
+                    ui.add_space(SPACE_LG);
+                    if ui.add(egui::Button::new(
+                        RichText::new("Reset zoom").color(T_SEC).font(FontId::proportional(12.0)),
+                    ).fill(SURFACE_RAISED).rounding(Rounding::same(RADIUS_MD)))
+                        .on_hover_text("Restore the default 100% scale (Ctrl+0)")
+                        .clicked()
+                    {
+                        ui.ctx().set_zoom_factor(1.0);
+                    }
+                });
+                ui.add_space(18.0);
+                ui.separator();
+                ui.add_space(18.0);
+
                 // try_lock: never block a UI frame waiting on a worker thread.
                 let mut settings = {
                     let Ok(guard) = self.viewmodel.playback.settings.try_lock() else { return; };
@@ -1597,7 +1673,7 @@ impl MeduzaApp {
                                 ui.horizontal(|ui| {
                                     ui.label(RichText::new("Meduza Music Player").color(T_PRI).font(FontId::proportional(18.0)).strong());
                                     ui.add_space(8.0);
-                                    ui.label(RichText::new("v1.2.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
+                                    ui.label(RichText::new("v1.3.0 (Release)").color(T_DIM).font(FontId::proportional(13.0)));
                                 });
 
                                 ui.add_space(4.0);
@@ -2234,8 +2310,9 @@ impl eframe::App for MeduzaApp {
             .frame(egui::Frame::none())
             .show(ctx, |ui| { self.topbar(ui); });
 
+        let sidebar_w = if self.sidebar_expanded { SIDEBAR_FULL } else { SIDEBAR_RAIL };
         egui::SidePanel::left("sidebar")
-            .exact_width(200.0)
+            .exact_width(sidebar_w)
             .resizable(false)
             .frame(egui::Frame::none())
             .show(ctx, |ui| { self.sidebar(ui); });
