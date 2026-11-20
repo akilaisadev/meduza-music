@@ -6,7 +6,7 @@ APP_NAME="MeduzaMusic"
 # `meduza-music` inside the AppDir to match the desktop file.
 BUILD_BINARY="meduza-ui"
 EXEC_NAME="meduza-music"
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 echo "Building AppImage for $APP_NAME v$VERSION..."
 
@@ -26,7 +26,7 @@ mkdir -p "$APPDIR/usr/share/icons/hicolor/512x512/apps"
 
 # Build the release binary
 echo "Compiling Rust binary..."
-cargo build --release
+cargo build --release --locked
 
 # Copy binary and strip it to make the AppImage as small as possible
 cp "target/release/$BUILD_BINARY" "$APPDIR/usr/bin/$EXEC_NAME"

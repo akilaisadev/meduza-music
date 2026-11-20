@@ -60,7 +60,16 @@ pub fn load() -> Vec<Playlist> {
         let _ = std::fs::remove_dir(&path);
     }
     let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new(); };
-    serde_json::from_str::<Vec<Playlist>>(&text).unwrap_or_default()
+    match serde_json::from_str::<Vec<Playlist>>(&text) {
+        Ok(playlists) => playlists,
+        Err(e) => {
+            // Keep the unreadable file: the next save would otherwise overwrite
+            // it and every playlist in it would be lost for good.
+            eprintln!("[Playlists] playlists.json is unreadable ({}); keeping a backup.", e);
+            let _ = std::fs::rename(&path, path.with_extension("json.corrupt"));
+            Vec::new()
+        }
+    }
 }
 
 pub fn save(playlists: &[Playlist]) {

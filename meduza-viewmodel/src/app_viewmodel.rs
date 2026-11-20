@@ -122,7 +122,10 @@ impl AppViewModel {
                     }
 
                     if let Ok(history) = vm.playback.history.try_lock() {
-                        let unique_hist = meduza_core::recommendation_engine::RecommendationEngine::filter_unique(&history, &mut seen);
+                        // Own set: sharing `seen` with heavy rotation dropped every
+                        // history entry that also ranked in the top heavy-rotation list.
+                        let mut history_seen = HashSet::new();
+                        let unique_hist = meduza_core::recommendation_engine::RecommendationEngine::filter_unique(&history, &mut history_seen);
                         if let Ok(mut snap) = vm.history_snapshot.write() {
                             if *snap != unique_hist {
                                 *snap = unique_hist;

@@ -129,15 +129,29 @@ pub fn write_private_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> 
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent);
     }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(contents)?;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    Ok(())
+    // Write a sibling temp file, flush it to disk, then rename it over the
+    // target. A crash or full disk mid-write leaves the previous complete file
+    // in place; truncating the real file in place would leave a half-written
+    // file that the loaders silently treat as empty (and the next save then
+    // overwrites it for good).
+    let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!(".{}.{}.tmp", file_name, std::process::id()));
+    let written = (|| -> std::io::Result<()> {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        f.write_all(contents)?;
+        f.sync_all()
+    })();
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path)
 }
 
 // ── SSRF defense: host allowlists for URLs the app is willing to fetch ──────
@@ -351,5 +365,26 @@ impl AppSettings {
     /// reasonably with the audio already playing.
     pub fn pace_downloads(&self) -> bool {
         self.low_end_mode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_private_replaces_contents_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("meduza-settings-test-{}", std::process::id()));
+        let path = dir.join("data.json");
+        write_private(&path, "first").unwrap();
+        write_private(&path, "second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        let temp_files = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

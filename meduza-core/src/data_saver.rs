@@ -94,6 +94,12 @@ impl DataSaver {
             if path.exists() {
                 if let Ok(meta) = fs::metadata(&path) {
                     if meta.len() > 100_000 {
+                        // A replay counts as recent use: the size-cap purge evicts
+                        // by mtime, so touch the file or the tracks being played
+                        // most are the first to be deleted.
+                        if let Ok(file) = fs::File::open(&path) {
+                            let _ = file.set_modified(std::time::SystemTime::now());
+                        }
                         return Some(path.to_string_lossy().to_string());
                     }
                 }
