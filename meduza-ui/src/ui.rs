@@ -58,6 +58,13 @@ pub struct MeduzaApp {
     // Settings screen cache (directory scan is expensive)
     cache_size_mb:        f32,
     cache_size_checked_at: Instant,
+
+    // ── Local playlists (issue #9) ────────────────────────────────────────────
+    add_to_playlist_target: Option<TrackItem>,
+    new_playlist_name:      String,
+    playlist_path:          String,
+    playlist_status:        Option<String>,
+    expanded_playlist:      Option<String>,
 }
 
 impl MeduzaApp {
@@ -165,6 +172,11 @@ impl MeduzaApp {
             cached_max_dim:    200,
             cache_size_mb:        0.0,
             cache_size_checked_at: Instant::now(),
+            add_to_playlist_target: None,
+            new_playlist_name: String::new(),
+            playlist_path: String::new(),
+            playlist_status: None,
+            expanded_playlist: None,
         }
     }
 
@@ -694,7 +706,19 @@ impl MeduzaApp {
             T_SEC,
         );
 
-        // Removed Animated Hover Green Play Button Overlay
+        // Add-to-playlist button (visible on hover)
+        if response.hovered() {
+            let btn_rect = egui::Rect::from_min_size(
+                rect.max - egui::vec2(34.0, 34.0),
+                Vec2::splat(26.0),
+            );
+            let btn = egui::Button::new(
+                RichText::new("+").color(Color32::BLACK).font(FontId::proportional(16.0)).strong()
+            ).fill(ACCENT).rounding(Rounding::same(13.0));
+            if ui.put(btn_rect, btn).on_hover_text("Add to playlist…").clicked() {
+                self.add_to_playlist_target = Some(track.clone());
+            }
+        }
 
         if response.clicked() {
             self.viewmodel.playback.play_now(track.clone());
@@ -914,6 +938,15 @@ impl MeduzaApp {
                     track.duration_str(), FontId::proportional(12.0), T_DIM);
             }
 
+            // Add-to-playlist button
+            let btn_rect = egui::Rect::from_center_size(
+                egui::pos2(rect.max.x - 76.0, rect.center().y), Vec2::splat(24.0));
+            if ui.put(btn_rect, egui::Button::new(
+                RichText::new("+").color(T_SEC).font(FontId::proportional(16.0))
+            ).frame(false)).on_hover_text("Add to playlist…").clicked() {
+                self.add_to_playlist_target = Some(track.clone());
+            }
+
             if resp.clicked() { self.viewmodel.playback.play_now(track.clone()); }
         }
     }
@@ -923,7 +956,10 @@ impl MeduzaApp {
     fn show_library(&mut self, ui: &mut egui::Ui) {
         let liked = self.viewmodel.liked_songs_snapshot.try_read()
             .map(|g| g.clone()).unwrap_or_default();
-        if liked.is_empty() {
+        let playlists = self.viewmodel.playback.playlists.try_lock()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        if liked.is_empty() && playlists.is_empty() {
             ui.add_space(60.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("🎵").font(FontId::proportional(64.0)));
@@ -931,20 +967,171 @@ impl MeduzaApp {
                 ui.label(RichText::new("Your library is empty").color(T_PRI)
                     .font(FontId::proportional(18.0)).strong());
                 ui.add_space(6.0);
-                ui.label(RichText::new("Click the 💚 icon on any song to save it.")
+                ui.label(RichText::new("Click the 💚 icon on any song, or create a playlist below.")
                     .color(T_SEC).font(FontId::proportional(13.0)));
             });
-        } else {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
-                .id_source("library")
-                .show(ui, |ui| {
+        }
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
+            .id_source("library")
+            .show(ui, |ui| {
                 ui.add_space(12.0);
-                ui.label(RichText::new("Liked Songs 💚")
+
+                // ── Playlists ────────────────────────────────────────────────
+                ui.label(RichText::new("Your Playlists")
                     .font(FontId::proportional(22.0)).strong());
-                ui.add_space(14.0);
-                self.track_list(ui, &liked);
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.new_playlist_name)
+                        .hint_text("New playlist name…").desired_width(220.0));
+                    if ui.add(egui::Button::new(
+                        RichText::new("Create").color(Color32::BLACK).font(FontId::proportional(12.0))
+                    ).fill(ACCENT).rounding(Rounding::same(8.0))).clicked() {
+                        let name = std::mem::take(&mut self.new_playlist_name);
+                        if self.viewmodel.playback.create_playlist(name).is_none() {
+                            self.playlist_status = Some("Enter a playlist name first.".to_string());
+                        } else {
+                            self.playlist_status = Some("Playlist created.".to_string());
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+
+                for pl in &playlists {
+                    let expanded = self.expanded_playlist.as_deref() == Some(pl.id.as_str());
+                    ui.horizontal(|ui| {
+                        if ui.button(if expanded { "▾" } else { "▸" }).clicked() {
+                            self.expanded_playlist = if expanded { None } else { Some(pl.id.clone()) };
+                        }
+                        if ui.add(egui::Button::new(
+                            RichText::new(trunc(&pl.name, 30)).color(T_PRI).font(FontId::proportional(14.0))
+                        ).frame(false)).clicked() {
+                            self.viewmodel.playback.play_playlist(&pl.id);
+                        }
+                        ui.label(RichText::new(format!("{} track{}", pl.tracks.len(), if pl.tracks.len() == 1 { "" } else { "s" }))
+                            .color(T_DIM).font(FontId::proportional(11.0)));
+                        if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::from_rgb(255, 100, 100))
+                            .font(FontId::proportional(11.0))).frame(false)).clicked() {
+                            self.viewmodel.playback.delete_playlist(&pl.id);
+                            if self.expanded_playlist.as_deref() == Some(pl.id.as_str()) {
+                                self.expanded_playlist = None;
+                            }
+                        }
+                    });
+                    if expanded {
+                        ui.indent("playlist_tracks", |ui| {
+                            if pl.tracks.is_empty() {
+                                ui.label(RichText::new("No tracks yet — use the + button on any song.")
+                                    .color(T_DIM).font(FontId::proportional(12.0)));
+                            } else {
+                                self.track_list_with_remove(ui, &pl.tracks, &pl.id);
+                            }
+                            ui.horizontal(|ui| {
+                                ui.add(egui::TextEdit::singleline(&mut self.playlist_path)
+                                    .hint_text("Export/import file path…").desired_width(240.0));
+                                if ui.button("Export").clicked() {
+                                    let path = std::path::PathBuf::from(&self.playlist_path);
+                                    self.playlist_status = Some(match self.viewmodel.playback.export_playlist(&pl.id, &path) {
+                                        Ok(()) => format!("Exported to {}", path.display()),
+                                        Err(e) => format!("Export failed: {}", e),
+                                    });
+                                }
+                                if ui.button("Import into").clicked() {
+                                    let path = std::path::PathBuf::from(&self.playlist_path);
+                                    self.playlist_status = Some(match self.viewmodel.playback.import_playlists(&path) {
+                                        Ok(n) => format!("Imported {} playlist(s).", n),
+                                        Err(e) => format!("Import failed: {}", e),
+                                    });
+                                }
+                            });
+                        });
+                    }
+                }
+
+                if let Some(ref status) = self.playlist_status {
+                    ui.label(RichText::new(status).color(T_SEC).font(FontId::proportional(11.0)));
+                }
+
+                if !liked.is_empty() {
+                    ui.add_space(24.0);
+                    ui.separator();
+                    ui.add_space(12.0);
+                    ui.label(RichText::new("Liked Songs 💚")
+                        .font(FontId::proportional(22.0)).strong());
+                    ui.add_space(14.0);
+                    self.track_list(ui, &liked);
+                }
+            });
+    }
+
+    fn show_add_to_playlist_window(&mut self, ctx: &egui::Context) {
+        let Some(track) = self.add_to_playlist_target.clone() else { return; };
+        let mut open = true;
+        let playlists = self.viewmodel.playback.playlists.try_lock()
+            .map(|g| g.clone()).unwrap_or_default();
+
+        egui::Window::new("Add to playlist")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(trunc(&track.title, 42)).color(T_PRI)
+                    .font(FontId::proportional(14.0)).strong());
+                ui.add_space(8.0);
+                if playlists.is_empty() {
+                    ui.label(RichText::new("No playlists yet — create one in Your Library.")
+                        .color(T_DIM).font(FontId::proportional(12.0)));
+                }
+                for pl in &playlists {
+                    let already = pl.contains(&track.media_id);
+                    let label = if already {
+                        format!("✓ {} (already added)", trunc(&pl.name, 28))
+                    } else {
+                        trunc(&pl.name, 28)
+                    };
+                    if ui.add(egui::Button::new(
+                        RichText::new(label).color(if already { T_DIM } else { T_PRI })
+                            .font(FontId::proportional(12.0))
+                    ).frame(false)).clicked() && !already {
+                        self.viewmodel.playback.add_to_playlist(&pl.id, track.clone());
+                        self.playlist_status = Some(format!("Added to {}", pl.name));
+                        self.add_to_playlist_target = None;
+                        return;
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.new_playlist_name)
+                        .hint_text("Or create new…").desired_width(180.0));
+                    if ui.button("Create & add").clicked() {
+                        let name = std::mem::take(&mut self.new_playlist_name);
+                        if let Some(id) = self.viewmodel.playback.create_playlist(name) {
+                            self.viewmodel.playback.add_to_playlist(&id, track.clone());
+                            self.playlist_status = Some("Playlist created and track added.".to_string());
+                            self.add_to_playlist_target = None;
+                        }
+                    }
+                });
+            });
+
+        if !open { self.add_to_playlist_target = None; }
+    }
+
+    fn track_list_with_remove(&mut self, ui: &mut egui::Ui, tracks: &[TrackItem], playlist_id: &str) {
+        for track in tracks {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(trunc(&track.title, 32)).color(T_PRI)
+                    .font(FontId::proportional(12.0)));
+                ui.label(RichText::new(trunc(&track.artist, 24)).color(T_DIM)
+                    .font(FontId::proportional(11.0)));
+                if ui.add(egui::Button::new(RichText::new("✕").color(T_SEC)
+                    .font(FontId::proportional(11.0))).frame(false)).clicked() {
+                    self.viewmodel.playback.remove_from_playlist(playlist_id, &track.media_id);
+                }
             });
         }
     }
@@ -2041,5 +2228,7 @@ impl eframe::App for MeduzaApp {
                     Tab::Settings => self.show_settings(ui),
                 }
             });
+
+        self.show_add_to_playlist_window(ctx);
     }
 }

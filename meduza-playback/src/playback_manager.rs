@@ -45,6 +45,7 @@ pub struct PlaybackManager {
     pub is_shuffle:    Arc<Mutex<bool>>,
     pub repeat_mode:   Arc<Mutex<RepeatMode>>,
     pub liked_songs:           Arc<Mutex<Vec<TrackItem>>>,
+    pub playlists:             Arc<Mutex<Vec<meduza_core::playlist::Playlist>>>,
     pub history:               Arc<Mutex<Vec<TrackItem>>>,
     pub settings:              Arc<Mutex<meduza_core::settings::AppSettings>>,
     pub stream_cache:          Arc<Mutex<Option<(String, String)>>>,
@@ -327,6 +328,8 @@ impl PlaybackManager {
             }
         }
 
+        let loaded_playlists = meduza_core::playlist::load();
+
         Self {
             state,
             current_track,
@@ -339,6 +342,7 @@ impl PlaybackManager {
             is_shuffle,
             repeat_mode,
             liked_songs:   Arc::new(Mutex::new(loaded_liked)),
+            playlists:     Arc::new(Mutex::new(loaded_playlists)),
             history,
             settings,
             stream_cache,
@@ -1148,6 +1152,93 @@ impl PlaybackManager {
                 let _ = meduza_core::settings::write_private(&path, &json_str);
             });
         }
+    }
+
+    // ── Local playlists (issue #9) ────────────────────────────────────────────
+
+    pub fn create_playlist(&self, name: String) -> Option<String> {
+        let name = name.trim().to_string();
+        if name.is_empty() { return None; }
+        let playlist = meduza_core::playlist::Playlist::new(name);
+        let id = playlist.id.clone();
+        let mut all = lk!(self.playlists);
+        all.push(playlist);
+        meduza_core::playlist::save(&all);
+        Some(id)
+    }
+
+    pub fn delete_playlist(&self, id: &str) {
+        let mut all = lk!(self.playlists);
+        all.retain(|p| p.id != id);
+        meduza_core::playlist::save(&all);
+    }
+
+    pub fn rename_playlist(&self, id: &str, name: String) -> bool {
+        let name = name.trim().to_string();
+        if name.is_empty() { return false; }
+        let mut all = lk!(self.playlists);
+        let Some(p) = all.iter_mut().find(|p| p.id == id) else { return false; };
+        p.name = name;
+        meduza_core::playlist::save(&all);
+        true
+    }
+
+    /// Returns true when the track was newly added.
+    pub fn add_to_playlist(&self, playlist_id: &str, track: TrackItem) -> bool {
+        let mut all = lk!(self.playlists);
+        let Some(p) = all.iter_mut().find(|p| p.id == playlist_id) else { return false; };
+        let added = p.add_track(track);
+        if added { meduza_core::playlist::save(&all); }
+        added
+    }
+
+    pub fn remove_from_playlist(&self, playlist_id: &str, media_id: &str) {
+        let mut all = lk!(self.playlists);
+        if let Some(p) = all.iter_mut().find(|p| p.id == playlist_id) {
+            p.remove_track(media_id);
+            meduza_core::playlist::save(&all);
+        }
+    }
+
+    /// Replace the playback queue with a playlist and play its first track.
+    pub fn play_playlist(&self, playlist_id: &str) {
+        let tracks: Vec<TrackItem> = {
+            let all = lk!(self.playlists);
+            all.iter().find(|p| p.id == playlist_id)
+                .map(|p| p.tracks.clone())
+                .unwrap_or_default()
+        };
+        if tracks.is_empty() { return; }
+        let first = tracks[0].clone();
+        {
+            let mut q = lk!(self.queue);
+            *q = tracks.into_iter().map(|t| QueueItem { track: t }).collect();
+        }
+        *lk!(self.queue_index) = 0;
+        self.play_now_without_queue_reset(first);
+    }
+
+    pub fn import_playlists(&self, path: &std::path::Path) -> Result<usize, String> {
+        let incoming = meduza_core::playlist::import_from_file(path)?;
+        let mut all = lk!(self.playlists);
+        let mut added = 0;
+        for mut p in incoming {
+            // Avoid duplicate IDs when importing the same file twice.
+            if all.iter().any(|existing| existing.id == p.id) {
+                p.id = meduza_core::playlist::Playlist::new(format!("{} (imported)", p.name)).id;
+            }
+            all.push(p);
+            added += 1;
+        }
+        meduza_core::playlist::save(&all);
+        Ok(added)
+    }
+
+    pub fn export_playlist(&self, playlist_id: &str, path: &std::path::Path) -> Result<(), String> {
+        let all = lk!(self.playlists);
+        let playlist = all.iter().find(|p| p.id == playlist_id)
+            .ok_or_else(|| "Playlist not found".to_string())?;
+        meduza_core::playlist::export_to_file(&[playlist.clone()], path)
     }
 
     /// Check & reset the track-ended flag (called from UI thread, no IPC).
